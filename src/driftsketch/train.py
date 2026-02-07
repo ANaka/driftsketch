@@ -6,8 +6,10 @@ import os
 
 import torch
 import torch.nn.functional as F
+import torch.nn.utils as nn_utils
 import wandb
 
+from driftsketch.inference import generate, plot_sketches
 from driftsketch.model import VectorSketchTransformer
 
 
@@ -82,11 +84,19 @@ def train() -> None:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--sample-every", type=int, default=200)
+    parser.add_argument("--output-dir", type=str, default="outputs")
     args = parser.parse_args()
 
     wandb.init(
         project="driftsketch",
-        config={"epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr},
+        config={
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "max_grad_norm": args.max_grad_norm,
+        },
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -115,14 +125,46 @@ def train() -> None:
 
         loss = F.mse_loss(v_pred, v_target)
 
+        # Per-class loss
+        mask_0 = labels == 0
+        mask_1 = labels == 1
+        loss_0 = F.mse_loss(v_pred[mask_0], v_target[mask_0]) if mask_0.any() else loss
+        loss_1 = F.mse_loss(v_pred[mask_1], v_target[mask_1]) if mask_1.any() else loss
+
         optimizer.zero_grad()
         loss.backward()
+        grad_norm = nn_utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         optimizer.step()
 
-        wandb.log({"loss": loss.item()})
+        metrics = {
+            "loss": loss.item(),
+            "loss_class_0": loss_0.item(),
+            "loss_class_1": loss_1.item(),
+            "grad_norm": grad_norm.item(),
+        }
+
+        # Periodic inference samples and metrics
+        is_sample_epoch = epoch % args.sample_every == 0 or epoch == args.epochs
+        if is_sample_epoch:
+            model.eval()
+            circles = generate(model, class_label=0, num_samples=4, num_steps=20, device=str(device))
+            squares = generate(model, class_label=1, num_samples=4, num_steps=20, device=str(device))
+            model.train()
+
+            all_pts = torch.cat([circles, squares], dim=0)
+            metrics["output_variance"] = all_pts.var().item()
+            metrics["output_mean_abs"] = all_pts.abs().mean().item()
+            metrics["output_std"] = all_pts.std().item()
+
+            os.makedirs(args.output_dir, exist_ok=True)
+            sample_path = os.path.join(args.output_dir, f"samples_epoch_{epoch:05d}.png")
+            plot_sketches(circles, squares, sample_path)
+            print(f"  Saved samples to {sample_path}")
+
+        wandb.log(metrics)
 
         if epoch % 50 == 0:
-            print(f"Epoch {epoch}/{args.epochs}  loss={loss.item():.6f}")
+            print(f"Epoch {epoch}/{args.epochs}  loss={loss.item():.6f}  grad_norm={grad_norm.item():.4f}")
 
     # Save checkpoint
     os.makedirs(args.checkpoint_dir, exist_ok=True)
