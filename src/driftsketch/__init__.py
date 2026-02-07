@@ -1,3 +1,3 @@
-from driftsketch.model import VectorSketchTransformer
+from driftsketch.model import BezierSketchTransformer, VectorSketchTransformer
 
-__all__ = ["VectorSketchTransformer"]
+__all__ = ["BezierSketchTransformer", "VectorSketchTransformer"]

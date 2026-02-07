@@ -1,177 +1,358 @@
-"""Training pipeline for Conditional Flow Matching sketch generation."""
+"""Training pipeline for Conditional Flow Matching Bezier sketch generation."""
 
 import argparse
-import math
 import os
 
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn.utils as nn_utils
-import wandb
+from torch.utils.data import DataLoader
 
-from driftsketch.inference import generate, plot_sketches
-from driftsketch.model import VectorSketchTransformer
+from driftsketch.data.controlsketch import ControlSketchDataset
+from driftsketch.model import BezierSketchTransformer
 
 
-def generate_batch(
-    batch_size: int, num_points: int, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate a batch of synthetic sketch data.
+def _eval_cubic_bezier(control_points: np.ndarray, num_samples: int = 20) -> np.ndarray:
+    """Evaluate a cubic Bezier curve at evenly spaced t values.
 
-    Returns (points, labels) where points is (B, N, 2) and labels is (B,)
-    integer tensor. First half = circles (label 0), second half = squares
-    (label 1).
+    Args:
+        control_points: (4, 2) array of control points [P0, P1, P2, P3].
+        num_samples: number of points to sample along the curve.
+
+    Returns:
+        (num_samples, 2) array of points on the curve.
     """
-    half = batch_size // 2
-    points_list = []
-    labels_list = []
+    ts = np.linspace(0, 1, num_samples, dtype=np.float32)
+    omt = 1.0 - ts
+    p0, p1, p2, p3 = control_points
+    pts = (
+        omt[:, None] ** 3 * p0
+        + 3 * omt[:, None] ** 2 * ts[:, None] * p1
+        + 3 * omt[:, None] * ts[:, None] ** 2 * p2
+        + ts[:, None] ** 3 * p3
+    )
+    return pts
 
-    # --- Circles (label 0) ---
-    angles = torch.linspace(0, 2 * math.pi, num_points + 1, device=device)[:num_points]
-    circle_base = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1)  # (N, 2)
-    circle_base = circle_base.unsqueeze(0).expand(half, -1, -1)  # (half, N, 2)
 
-    scale = torch.empty(half, 1, 1, device=device).uniform_(0.3, 1.0)
-    offset = torch.empty(half, 1, 2, device=device).uniform_(-0.5, 0.5)
-    noise = torch.randn(half, num_points, 2, device=device) * 0.02
+def _plot_bezier_samples(
+    beziers: torch.Tensor,
+    labels: torch.Tensor,
+    label_names: dict[int, str],
+    save_path: str,
+) -> None:
+    """Plot generated Bezier sketch samples in a grid.
 
-    circles = circle_base * scale + offset + noise
-    points_list.append(circles)
-    labels_list.append(torch.zeros(half, dtype=torch.long, device=device))
+    Args:
+        beziers: (N, 32, 4, 2) control points in [-1, 1].
+        labels: (N,) integer class labels.
+        save_path: path to save the figure.
+    """
+    n = beziers.shape[0]
+    cols = min(n, 4)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(3 * cols, 3 * rows))
+    if rows == 1 and cols == 1:
+        axes = np.array([axes])
+    axes = np.array(axes).flatten()
 
-    # --- Squares (label 1) ---
-    points_per_edge = num_points // 4
-    remainder = num_points - points_per_edge * 4
+    for i in range(n):
+        ax = axes[i]
+        strokes = beziers[i].cpu().numpy()  # (32, 4, 2)
+        for s in range(strokes.shape[0]):
+            pts = _eval_cubic_bezier(strokes[s])
+            ax.plot(pts[:, 0], pts[:, 1], linewidth=0.8, color="black")
+        cls_name = label_names.get(labels[i].item(), str(labels[i].item()))
+        ax.set_title(cls_name, fontsize=8)
+        ax.set_xlim(-1.2, 1.2)
+        ax.set_ylim(-1.2, 1.2)
+        ax.set_aspect("equal")
+        ax.invert_yaxis()
+        ax.axis("off")
 
-    edge_points = []
-    # Top edge: x from -1 to 1, y = 1
-    n = points_per_edge + (1 if remainder > 0 else 0)
-    t = torch.linspace(0, 1, n + 1, device=device)[:n]
-    edge_points.append(torch.stack([t * 2 - 1, torch.ones(n, device=device)], dim=-1))
-    # Right edge: x = 1, y from 1 to -1
-    n = points_per_edge + (1 if remainder > 1 else 0)
-    t = torch.linspace(0, 1, n + 1, device=device)[:n]
-    edge_points.append(torch.stack([torch.ones(n, device=device), 1 - t * 2], dim=-1))
-    # Bottom edge: x from 1 to -1, y = -1
-    n = points_per_edge + (1 if remainder > 2 else 0)
-    t = torch.linspace(0, 1, n + 1, device=device)[:n]
-    edge_points.append(torch.stack([1 - t * 2, -torch.ones(n, device=device)], dim=-1))
-    # Left edge: x = -1, y from -1 to 1
-    n = points_per_edge
-    t = torch.linspace(0, 1, n + 1, device=device)[:n]
-    edge_points.append(torch.stack([-torch.ones(n, device=device), t * 2 - 1], dim=-1))
+    for i in range(n, len(axes)):
+        axes[i].axis("off")
 
-    square_base = torch.cat(edge_points, dim=0)[:num_points]  # (N, 2)
-    square_base = square_base.unsqueeze(0).expand(half, -1, -1)  # (half, N, 2)
-
-    scale = torch.empty(half, 1, 1, device=device).uniform_(0.3, 1.0)
-    offset = torch.empty(half, 1, 2, device=device).uniform_(-0.5, 0.5)
-    noise = torch.randn(half, num_points, 2, device=device) * 0.02
-
-    squares = square_base * scale + offset + noise
-    points_list.append(squares)
-    labels_list.append(torch.ones(half, dtype=torch.long, device=device))
-
-    points = torch.cat(points_list, dim=0)  # (B, N, 2)
-    labels = torch.cat(labels_list, dim=0)  # (B,)
-    return points, labels
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close(fig)
 
 
 def train() -> None:
-    """Train the CFM sketch generation model."""
+    """Train the CFM Bezier sketch generation model."""
     parser = argparse.ArgumentParser(description="Train DriftSketch CFM model")
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--sample-every", type=int, default=200)
-    parser.add_argument("--output-dir", type=str, default="outputs")
+    parser.add_argument("--sample-every", type=int, default=10)
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--data-dir", type=str, default=None, help="ControlSketch data root")
+    parser.add_argument("--categories", nargs="+", default=None, help="Category names to use")
+    parser.add_argument("--split", type=str, default="train", help="Dataset split")
+    parser.add_argument("--num-classes", type=int, default=None, help="Number of classes (auto from dataset if omitted)")
+    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--use-clip", action="store_true", help="Enable CLIP image conditioning")
+    parser.add_argument("--p-uncond", type=float, default=0.1, help="Probability of dropping conditioning for CFG")
+    parser.add_argument("--clip-model", type=str, default="ViT-B-32", help="CLIP model name")
+    parser.add_argument("--clip-pretrained", type=str, default="laion2b_s34b_b79k", help="CLIP pretrained weights")
+    parser.add_argument("--pixel-loss-weight", type=float, default=0.0, help="Weight for pixel rendering loss")
+    parser.add_argument("--velocity-loss-weight", type=float, default=1.0, help="Weight for velocity MSE loss")
+    parser.add_argument("--pixel-batch-size", type=int, default=4, help="How many samples to render per batch")
+    parser.add_argument("--pixel-canvas-size", type=int, default=128, help="Canvas size for differentiable rendering")
     args = parser.parse_args()
 
-    wandb.init(
-        project="driftsketch",
-        config={
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "max_grad_norm": args.max_grad_norm,
-        },
-    )
+    # --- wandb setup ---
+    wandb_run = None
+    if not args.no_wandb:
+        import wandb
 
+        wandb_run = wandb.init(
+            project="driftsketch",
+            config={
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "lr": args.lr,
+                "max_grad_norm": args.max_grad_norm,
+                "dataset": "controlsketch",
+                "split": args.split,
+            },
+        )
+
+    # --- Device ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = VectorSketchTransformer().to(device)
+    # --- CLIP encoder (must be created before dataset for transform) ---
+    if args.use_clip:
+        from driftsketch.clip_encoder import FrozenCLIPImageEncoder
+
+        clip_encoder = FrozenCLIPImageEncoder(args.clip_model, args.clip_pretrained).to(device)
+        clip_encoder.eval()
+        clip_dim = clip_encoder.feature_dim
+    else:
+        clip_encoder = None
+        clip_dim = 0
+
+    # --- Dataset ---
+    dataset = ControlSketchDataset(
+        split=args.split,
+        categories=args.categories,
+        data_dir=args.data_dir,
+        return_images=args.use_clip,
+        image_transform=clip_encoder.get_transform() if clip_encoder else None,
+    )
+    num_classes = args.num_classes if args.num_classes is not None else dataset.num_classes
+    label_names = dataset.label_to_category
+    print(f"Dataset: {len(dataset)} samples, {num_classes} classes")
+    print(f"Categories: {dataset.categories}")
+
+    if wandb_run:
+        import wandb
+
+        wandb_config_update = {"num_classes": num_classes, "categories": dataset.categories}
+        if args.use_clip:
+            wandb_config_update.update({
+                "use_clip": True,
+                "clip_model": args.clip_model,
+                "clip_pretrained": args.clip_pretrained,
+                "clip_dim": clip_dim,
+                "p_uncond": args.p_uncond,
+            })
+        if args.pixel_loss_weight > 0:
+            wandb_config_update["pixel_loss_weight"] = args.pixel_loss_weight
+            wandb_config_update["velocity_loss_weight"] = args.velocity_loss_weight
+            wandb_config_update["pixel_batch_size"] = args.pixel_batch_size
+            wandb_config_update["pixel_canvas_size"] = args.pixel_canvas_size
+        wandb.config.update(wandb_config_update)
+
+    collate_fn = None
+    if args.use_clip:
+        from driftsketch.data.controlsketch import controlsketch_collate_fn
+
+        collate_fn = controlsketch_collate_fn
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        collate_fn=collate_fn,
+    )
+
+    # --- Output directory ---
+    if wandb_run:
+        output_dir = os.path.join("outputs", "training", wandb_run.id)
+    else:
+        output_dir = os.path.join("outputs", "training", "local")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # --- Model ---
+    model = BezierSketchTransformer(num_classes=num_classes, clip_dim=clip_dim).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
+    # Pick a few classes to visualize during training
+    viz_classes = list(range(min(6, num_classes)))
+    num_vis_per_class = 2
+
+    # --- Training loop ---
+    global_step = 0
     for epoch in range(1, args.epochs + 1):
-        x1, labels = generate_batch(args.batch_size, model.num_points, device)
+        model.train()
+        epoch_loss = 0.0
+        epoch_vel = 0.0
+        epoch_pix = 0.0
+        num_batches = 0
 
-        # Sample noise (source distribution)
-        x0 = torch.randn_like(x1)
+        for batch in dataloader:
+            beziers = batch["beziers"]  # (B, 32, 4, 2)
+            B = beziers.shape[0]
+            x1 = beziers.view(B, 32, 8).to(device)  # flatten to (B, 32, 8)
+            labels = batch["label"].to(device)
 
-        # Sample time uniformly in [0, 1], shaped for broadcasting over (N, 2)
-        t = torch.rand(args.batch_size, 1, 1, device=device)
+            x0 = torch.randn_like(x1)
+            t = torch.rand(B, 1, 1, device=device)
+            xt = (1 - t) * x0 + t * x1
+            v_target = x1 - x0
 
-        # Interpolate
-        xt = (1 - t) * x0 + t * x1
+            clip_features = None
+            cfg_mask = None
+            if clip_encoder is not None:
+                images = batch["image"].to(device)  # (B, 3, 224, 224)
+                clip_features = clip_encoder(images)  # (B, 50, 768)
+                cfg_mask = torch.rand(B, device=device) < args.p_uncond  # (B,) bool
 
-        # Target velocity field
-        v_target = x1 - x0
+            v_pred = model(xt, t.squeeze(-1).squeeze(-1), labels, clip_features=clip_features, cfg_mask=cfg_mask)
 
-        # Predict velocity
-        v_pred = model(xt, t.squeeze(-1).squeeze(-1), labels)
+            loss_velocity = F.mse_loss(v_pred, v_target)
 
-        loss = F.mse_loss(v_pred, v_target)
+            loss_pixel = torch.tensor(0.0, device=device)
+            if args.pixel_loss_weight > 0:
+                from driftsketch.rendering import render_batch_beziers
 
-        # Per-class loss
-        mask_0 = labels == 0
-        mask_1 = labels == 1
-        loss_0 = F.mse_loss(v_pred[mask_0], v_target[mask_0]) if mask_0.any() else loss
-        loss_1 = F.mse_loss(v_pred[mask_1], v_target[mask_1]) if mask_1.any() else loss
+                K = min(B, args.pixel_batch_size)
+                # One-step denoised estimate: x1_hat = xt + (1 - t) * v_pred
+                x1_hat = xt[:K] + (1 - t[:K]) * v_pred[:K]
+                rendered_pred = render_batch_beziers(
+                    x1_hat.view(-1, 32, 4, 2),
+                    canvas_size=args.pixel_canvas_size,
+                    max_render=K,
+                )
+                with torch.no_grad():
+                    rendered_target = render_batch_beziers(
+                        x1[:K].view(-1, 32, 4, 2),
+                        canvas_size=args.pixel_canvas_size,
+                        max_render=K,
+                    )
+                loss_pixel = F.mse_loss(rendered_pred, rendered_target)
 
-        optimizer.zero_grad()
-        loss.backward()
-        grad_norm = nn_utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-        optimizer.step()
+            loss = args.velocity_loss_weight * loss_velocity + args.pixel_loss_weight * loss_pixel
 
-        metrics = {
-            "loss": loss.item(),
-            "loss_class_0": loss_0.item(),
-            "loss_class_1": loss_1.item(),
-            "grad_norm": grad_norm.item(),
-        }
+            optimizer.zero_grad()
+            loss.backward()
+            grad_norm = nn_utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            optimizer.step()
 
-        # Periodic inference samples and metrics
+            if wandb_run:
+                import wandb
+
+                metrics = {"loss": loss.item(), "loss_velocity": loss_velocity.item(), "grad_norm": grad_norm.item()}
+                if args.pixel_loss_weight > 0:
+                    metrics["loss_pixel"] = loss_pixel.item()
+                wandb.log(metrics, step=global_step)
+
+            epoch_loss += loss.item()
+            epoch_vel += loss_velocity.item()
+            epoch_pix += loss_pixel.item()
+            num_batches += 1
+            global_step += 1
+
+        avg_loss = epoch_loss / max(num_batches, 1)
+        avg_vel = epoch_vel / max(num_batches, 1)
+        avg_pix = epoch_pix / max(num_batches, 1)
+        print(f"Epoch {epoch}/{args.epochs}  avg_loss={avg_loss:.6f}  avg_vel={avg_vel:.6f}  avg_pix={avg_pix:.6f}")
+
+        if wandb_run:
+            import wandb
+
+            wandb.log({"epoch_avg_loss": avg_loss}, step=global_step)
+
+        # --- Periodic sample generation ---
         is_sample_epoch = epoch % args.sample_every == 0 or epoch == args.epochs
         if is_sample_epoch:
             model.eval()
-            circles = generate(model, class_label=0, num_samples=4, num_steps=20, device=str(device))
-            squares = generate(model, class_label=1, num_samples=4, num_steps=20, device=str(device))
-            model.train()
+            num_vis = num_vis_per_class * len(viz_classes)
+            vis_labels = torch.tensor(
+                [c for c in viz_classes for _ in range(num_vis_per_class)],
+                dtype=torch.long,
+                device=device,
+            )
 
-            all_pts = torch.cat([circles, squares], dim=0)
-            metrics["output_variance"] = all_pts.var().item()
-            metrics["output_mean_abs"] = all_pts.abs().mean().item()
-            metrics["output_std"] = all_pts.std().item()
+            with torch.no_grad():
+                x = torch.randn(num_vis, 32, 8, device=device)
+                num_steps = 20
+                dt = 1.0 / num_steps
+                for step_i in range(num_steps):
+                    t_val = torch.full((num_vis,), step_i * dt, device=device)
+                    v = model(x, t_val, vis_labels)
+                    x = x + v * dt
 
-            os.makedirs(args.output_dir, exist_ok=True)
-            sample_path = os.path.join(args.output_dir, f"samples_epoch_{epoch:05d}.png")
-            plot_sketches(circles, squares, sample_path)
+                # Reshape to (num_vis, 32, 4, 2) for plotting
+                generated_beziers = x.view(num_vis, 32, 4, 2)
+
+            if wandb_run:
+                import wandb
+
+                wandb.log(
+                    {
+                        "output_variance": x.var().item(),
+                        "output_mean_abs": x.abs().mean().item(),
+                        "output_std": x.std().item(),
+                    },
+                    step=global_step,
+                )
+
+            sample_path = os.path.join(output_dir, f"samples_epoch_{epoch:04d}.png")
+            _plot_bezier_samples(generated_beziers, vis_labels, label_names, sample_path)
             print(f"  Saved samples to {sample_path}")
 
-        wandb.log(metrics)
+            if wandb_run:
+                import wandb
 
-        if epoch % 50 == 0:
-            print(f"Epoch {epoch}/{args.epochs}  loss={loss.item():.6f}  grad_norm={grad_norm.item():.4f}")
+                wandb.log(
+                    {"samples": wandb.Image(sample_path)},
+                    step=global_step,
+                )
 
-    # Save checkpoint
+    # --- Save checkpoint ---
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(args.checkpoint_dir, "model.pt")
-    torch.save(model.state_dict(), checkpoint_path)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": args.epochs,
+            "config": {
+                "num_strokes": 32,
+                "coords_per_stroke": 8,
+                "embed_dim": model.embed_dim,
+                "num_classes": num_classes,
+                "categories": dataset.categories,
+                "clip_dim": clip_dim,
+            },
+        },
+        checkpoint_path,
+    )
     print(f"Saved checkpoint to {checkpoint_path}")
-    wandb.finish()
+
+    if wandb_run:
+        import wandb
+
+        wandb.finish()
 
 
 if __name__ == "__main__":

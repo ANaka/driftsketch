@@ -1,5 +1,7 @@
 """PyTorch Dataset for ControlSketch (SwiftSketch) — paired image + SVG Bezier sketches."""
 
+from __future__ import annotations
+
 import io
 import re
 from pathlib import Path
@@ -97,11 +99,13 @@ class ControlSketchDataset(Dataset):
         num_points: int = 64,
         data_dir: str | Path | None = None,
         return_images: bool = False,
+        image_transform: callable | None = None,
     ):
         self.data_dir = Path(data_dir) if data_dir else _DEFAULT_DATA_DIR
         self.split_dir = self.data_dir / split
         self.num_points = num_points
         self.return_images = return_images
+        self.image_transform = image_transform
 
         if not self.split_dir.exists():
             raise FileNotFoundError(f"Split directory not found: {self.split_dir}")
@@ -149,6 +153,11 @@ class ControlSketchDataset(Dataset):
             result["attn_map"] = torch.from_numpy(data["attn_map"].copy())  # (512, 512)
             result["mask"] = torch.from_numpy(data["mask"].copy())          # (512, 512)
 
+            if self.image_transform is not None:
+                from PIL import Image
+                img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                result["image"] = self.image_transform(img)
+
         return result
 
     def stats(self) -> dict:
@@ -163,3 +172,15 @@ class ControlSketchDataset(Dataset):
             "samples_per_category": per_cat,
             "num_points": self.num_points,
         }
+
+
+def controlsketch_collate_fn(batch: list[dict]) -> dict:
+    """Custom collate that handles mixed tensor/non-tensor fields."""
+    result = {}
+    for key in batch[0]:
+        values = [sample[key] for sample in batch]
+        if isinstance(values[0], torch.Tensor):
+            result[key] = torch.stack(values)
+        else:
+            result[key] = values  # keep as list for non-tensor fields
+    return result
