@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Model artifacts
+checkpoints/
+outputs/
+
+# Dataset files (large)
+data/raw/
+data/processed/
