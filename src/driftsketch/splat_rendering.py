@@ -7,7 +7,7 @@ Based on Bezier Splatting (https://arxiv.org/abs/2503.16424).
 """
 
 import torch
-import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 def _evaluate_bezier(control_points: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -157,41 +157,36 @@ def splat_render_beziers(
     pixels = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)  # (H*W, 2)
     total_pixels = pixels.shape[0]
 
-    # 7. Compute alpha accumulation in chunks
-    output = torch.zeros(B, total_pixels, device=device, dtype=dtype)
+    # 7. Compute alpha accumulation in chunks with gradient checkpointing
+    # Checkpointing trades compute for memory: intermediates are recomputed
+    # during backward instead of being stored, keeping memory bounded.
+    bytes_per_element = 4 if dtype == torch.float32 else 2
+    max_chunk_memory = 512 * 1024 * 1024  # 512 MB peak per chunk
+    adaptive_chunk = max(64, max_chunk_memory // (B * G * bytes_per_element * 6))
+    chunk_size = min(pixel_chunk_size, adaptive_chunk, total_pixels)
 
-    for start in range(0, total_pixels, pixel_chunk_size):
-        end = min(start + pixel_chunk_size, total_pixels)
-        chunk_pixels = pixels[start:end]  # (P, 2)
-        P = chunk_pixels.shape[0]
+    def _splat_chunk(chunk_pixels, means_f, cos_f, sin_f, inv_sa2_f, inv_sc2_f):
+        """Compute alpha accumulation for a chunk of pixels."""
+        dx = chunk_pixels[None, None, :, 0] - means_f[:, :, None, 0]  # (B, G, P)
+        dy = chunk_pixels[None, None, :, 1] - means_f[:, :, None, 1]  # (B, G, P)
+        d_along = cos_f[:, :, None] * dx + sin_f[:, :, None] * dy
+        d_across = -sin_f[:, :, None] * dx + cos_f[:, :, None] * dy
+        mahal_sq = d_along.square() * inv_sa2_f[:, :, None] + d_across.square() * inv_sc2_f[:, :, None]
+        alpha = torch.exp(-0.5 * mahal_sq.clamp(max=20.0))
+        return alpha.sum(dim=1)  # (B, P)
 
-        # Displacement: pixel - mean for all Gaussians
-        # chunk_pixels: (P, 2) -> (1, 1, P, 2)
-        # means_flat: (B, G, 2) -> (B, G, 1, 2)
-        dx = chunk_pixels[None, None, :, 0] - means_flat[:, :, None, 0]  # (B, G, P)
-        dy = chunk_pixels[None, None, :, 1] - means_flat[:, :, None, 1]  # (B, G, P)
+    chunks = []
+    for start in range(0, total_pixels, chunk_size):
+        end = min(start + chunk_size, total_pixels)
+        chunk_pixels = pixels[start:end]
+        chunk_out = checkpoint(
+            _splat_chunk, chunk_pixels,
+            means_flat, cos_flat, sin_flat, inv_sa2_flat, inv_sc2_flat,
+            use_reentrant=False,
+        )
+        chunks.append(chunk_out)
 
-        # Rotate displacement into local frame
-        # along = cos * dx + sin * dy
-        # across = -sin * dx + cos * dy
-        cos_exp = cos_flat[:, :, None]  # (B, G, 1)
-        sin_exp = sin_flat[:, :, None]  # (B, G, 1)
-
-        d_along = cos_exp * dx + sin_exp * dy  # (B, G, P)
-        d_across = -sin_exp * dx + cos_exp * dy  # (B, G, P)
-
-        # Mahalanobis distance squared
-        inv_sa2_exp = inv_sa2_flat[:, :, None]  # (B, G, 1)
-        inv_sc2_exp = inv_sc2_flat[:, :, None]  # (B, G, 1)
-
-        mahal_sq = d_along * d_along * inv_sa2_exp + d_across * d_across * inv_sc2_exp
-        # (B, G, P)
-
-        # Gaussian alpha (clamp exponent for numerical stability)
-        alpha = torch.exp(-0.5 * mahal_sq.clamp(max=20.0))  # (B, G, P)
-
-        # Sum over all Gaussians
-        output[:, start:end] = alpha.sum(dim=1)  # (B, P)
+    output = torch.cat(chunks, dim=1)  # (B, total_pixels)
 
     # 8. Reshape and compose: white background, black strokes
     output = output.reshape(B, H, W)
