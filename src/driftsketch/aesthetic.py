@@ -109,11 +109,11 @@ class AestheticScorer(nn.Module):
         # -- Store CLIP normalization as buffers (move with .to()) -----------
         self.register_buffer(
             "_clip_mean",
-            torch.tensor(_CLIP_MEAN, dtype=torch.float32).view(1, 3, 1, 1),
+            torch.tensor(_CLIP_MEAN, dtype=torch.float32, device=device).view(1, 3, 1, 1),
         )
         self.register_buffer(
             "_clip_std",
-            torch.tensor(_CLIP_STD, dtype=torch.float32).view(1, 3, 1, 1),
+            torch.tensor(_CLIP_STD, dtype=torch.float32, device=device).view(1, 3, 1, 1),
         )
 
         self._device = device
