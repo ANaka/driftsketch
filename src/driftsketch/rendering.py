@@ -1,9 +1,12 @@
-"""Differentiable rendering utilities using pydiffvg (easydiffvg).
+"""Differentiable rendering utilities for Bezier stroke sketches.
 
-Renders Bezier stroke sketches to raster images with full gradient support.
+Default renderer: pure-PyTorch Gaussian splatting (splat_rendering.py).
+Fallback: pydiffvg (easydiffvg) for comparison/validation.
 """
 
 import torch
+
+from driftsketch.splat_rendering import splat_render_beziers
 
 
 def render_beziers_differentiable(
@@ -11,6 +14,7 @@ def render_beziers_differentiable(
     canvas_size: int = 128,
     stroke_width: float = 2.0,
     softness: float = 1.0,
+    renderer: str = "splat",
 ) -> torch.Tensor:
     """Differentiably render a single sketch's Bezier strokes.
 
@@ -18,11 +22,22 @@ def render_beziers_differentiable(
         beziers: (32, 4, 2) cubic Bezier control points in [-1, 1].
         canvas_size: Output image size in pixels.
         stroke_width: Width of rendered strokes in pixels.
-        softness: Edge softness for anti-aliasing (higher = smoother gradients).
+        softness: Edge softness for anti-aliasing (pydiffvg only).
+        renderer: "splat" (default) or "pydiffvg".
 
     Returns:
         (H, W) grayscale image tensor -- white background (1.0), black strokes (0.0).
     """
+    if renderer == "splat":
+        # Add batch dim, render, squeeze
+        out = splat_render_beziers(
+            beziers.unsqueeze(0),
+            canvas_size=canvas_size,
+            stroke_width=stroke_width,
+        )
+        return out.squeeze(0)
+
+    # pydiffvg fallback
     import pydiffvg
 
     num_strokes = beziers.shape[0]
@@ -63,7 +78,8 @@ def render_batch_beziers(
     beziers: torch.Tensor,
     canvas_size: int = 128,
     stroke_width: float = 2.0,
-    max_render: int = 4,
+    max_render: int | None = None,
+    renderer: str = "splat",
 ) -> torch.Tensor:
     """Render a batch of Bezier sketches.
 
@@ -71,16 +87,30 @@ def render_batch_beziers(
         beziers: (B, 32, 4, 2) batch of sketches.
         canvas_size: Output image size.
         stroke_width: Stroke width in pixels.
-        max_render: Max samples to render (no batch rendering in pydiffvg).
+        max_render: Max samples to render. With splat renderer this only
+            slices the input (no sequential loop needed). None = render all.
+        renderer: "splat" (default) or "pydiffvg".
 
     Returns:
         (n, H, W) stacked grayscale images where n = min(B, max_render).
     """
-    n = min(beziers.shape[0], max_render)
+    if max_render is not None:
+        beziers = beziers[:max_render]
+
+    if renderer == "splat":
+        return splat_render_beziers(
+            beziers, canvas_size=canvas_size, stroke_width=stroke_width
+        )
+
+    # pydiffvg fallback: sequential loop
+    n = beziers.shape[0]
     images = []
     for i in range(n):
         img = render_beziers_differentiable(
-            beziers[i], canvas_size=canvas_size, stroke_width=stroke_width
+            beziers[i],
+            canvas_size=canvas_size,
+            stroke_width=stroke_width,
+            renderer="pydiffvg",
         )
         images.append(img)
     return torch.stack(images)
