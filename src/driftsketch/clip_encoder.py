@@ -41,7 +41,6 @@ class FrozenCLIPImageEncoder(nn.Module):
         """Return the CLIP preprocessing transform (resize, normalize, etc.)."""
         return self._preprocess
 
-    @torch.no_grad()
     def forward(self, images: Tensor) -> Tensor:
         """Extract patch-level features from images.
 

@@ -132,6 +132,12 @@ def train() -> None:
     parser.add_argument("--num-layers", type=int, default=8, help="Number of transformer layers")
     parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
     parser.add_argument("--dropout", type=float, default=0.0, help="Dropout rate")
+    # Distillation mode
+    parser.add_argument("--distill", action="store_true", help="Enable distillation training mode")
+    parser.add_argument("--distill-image-dir", type=str, default=None, help="Directory of images for distillation")
+    parser.add_argument("--distill-ode-steps", type=int, default=4, help="ODE steps during distillation training")
+    parser.add_argument("--distill-augmentations", type=int, default=4, help="CLIP augmentations per sample")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to bootstrap checkpoint to load")
     args = parser.parse_args()
 
     # --- wandb setup ---
@@ -146,7 +152,7 @@ def train() -> None:
                 "batch_size": args.batch_size,
                 "lr": args.lr,
                 "max_grad_norm": args.max_grad_norm,
-                "dataset": "controlsketch",
+                "dataset": "distill" if args.distill else "controlsketch",
                 "split": args.split,
                 "model_type": args.model_type,
                 "embed_dim": args.embed_dim,
@@ -158,6 +164,15 @@ def train() -> None:
                 "ema_decay": args.ema_decay,
             },
         )
+
+    # --- Validate distillation args ---
+    if args.distill:
+        if not args.use_clip:
+            parser.error("--distill requires --use-clip")
+        if not args.distill_image_dir:
+            parser.error("--distill requires --distill-image-dir")
+        if not args.checkpoint:
+            parser.error("--distill requires --checkpoint")
 
     # --- Device ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -175,22 +190,36 @@ def train() -> None:
         clip_dim = 0
 
     # --- Dataset ---
-    dataset = ControlSketchDataset(
-        split=args.split,
-        categories=args.categories,
-        data_dir=args.data_dir,
-        return_images=args.use_clip,
-        image_transform=clip_encoder.get_transform() if clip_encoder else None,
-    )
-    num_classes = args.num_classes if args.num_classes is not None else dataset.num_classes
-    label_names = dataset.label_to_category
-    print(f"Dataset: {len(dataset)} samples, {num_classes} classes")
-    print(f"Categories: {dataset.categories}")
+    if args.distill:
+        from driftsketch.data.images import ImageDataset
+
+        dataset = ImageDataset(
+            root=args.distill_image_dir,
+            transform=clip_encoder.get_transform(),
+        )
+        # num_classes and label_names come from checkpoint (loaded below)
+        num_classes = None
+        label_names = {}
+        categories = []
+        print(f"Distillation dataset: {len(dataset)} images from {args.distill_image_dir}")
+    else:
+        dataset = ControlSketchDataset(
+            split=args.split,
+            categories=args.categories,
+            data_dir=args.data_dir,
+            return_images=args.use_clip,
+            image_transform=clip_encoder.get_transform() if clip_encoder else None,
+        )
+        num_classes = args.num_classes if args.num_classes is not None else dataset.num_classes
+        label_names = dataset.label_to_category
+        categories = dataset.categories
+        print(f"Dataset: {len(dataset)} samples, {num_classes} classes")
+        print(f"Categories: {categories}")
 
     if wandb_run:
         import wandb
 
-        wandb_config_update = {"num_classes": num_classes, "categories": dataset.categories}
+        wandb_config_update = {"num_classes": num_classes, "categories": categories}
         if args.use_clip:
             wandb_config_update.update({
                 "use_clip": True,
@@ -218,10 +247,18 @@ def train() -> None:
             "density_grid_size": args.density_grid_size,
             "density_threshold": args.density_threshold,
         })
+        if args.distill:
+            wandb_config_update.update({
+                "distill": True,
+                "distill_image_dir": args.distill_image_dir,
+                "distill_ode_steps": args.distill_ode_steps,
+                "distill_augmentations": args.distill_augmentations,
+                "bootstrap_checkpoint": args.checkpoint,
+            })
         wandb.config.update(wandb_config_update)
 
     collate_fn = None
-    if args.use_clip:
+    if args.distill or args.use_clip:
         from driftsketch.data.controlsketch import controlsketch_collate_fn
 
         collate_fn = controlsketch_collate_fn
@@ -243,6 +280,17 @@ def train() -> None:
         output_dir = os.path.join("outputs", "training", "local")
     os.makedirs(output_dir, exist_ok=True)
 
+    # --- Checkpoint loading ---
+    checkpoint_data = None
+    if args.checkpoint:
+        checkpoint_data = torch.load(args.checkpoint, map_location=device, weights_only=False)
+        ckpt_config = checkpoint_data.get("config", {})
+        if args.distill:
+            num_classes = ckpt_config.get("num_classes", num_classes)
+            categories = ckpt_config.get("categories", categories)
+            label_names = {i: cat for i, cat in enumerate(categories)}
+            print(f"Loaded checkpoint config: {num_classes} classes, categories={categories}")
+
     # --- Model ---
     model_kwargs = dict(
         num_classes=num_classes,
@@ -255,6 +303,10 @@ def train() -> None:
         model = BezierSketchDiT(**model_kwargs, dropout=args.dropout).to(device)
     else:
         model = BezierSketchTransformer(**model_kwargs).to(device)
+
+    if checkpoint_data is not None:
+        model.load_state_dict(checkpoint_data["model_state_dict"])
+        print(f"Loaded model weights from {args.checkpoint}")
 
     # Separate param groups: no weight decay on biases, norms, embeddings
     decay_params = []
@@ -270,6 +322,11 @@ def train() -> None:
         {"params": decay_params, "weight_decay": args.weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
     ], lr=args.lr)
+
+    if checkpoint_data is not None and not args.distill:
+        # Restore optimizer state for continued training (not distillation — fresh optimizer for new objective)
+        if "optimizer_state_dict" in checkpoint_data:
+            optimizer.load_state_dict(checkpoint_data["optimizer_state_dict"])
 
     # --- LR scheduler: linear warmup + cosine decay ---
     warmup_epochs = args.warmup_epochs if args.warmup_epochs is not None else max(1, args.epochs // 20)
@@ -318,6 +375,18 @@ def train() -> None:
 
         aesthetic_scorer = AestheticScorer(model_path=args.aesthetic_model_path, device=device)
 
+    # --- Distillation loss setup ---
+    perceptual_loss_fn = None
+    if args.distill:
+        from driftsketch.perceptual import CLIPPerceptualLoss
+        from driftsketch.rendering import render_batch_beziers  # noqa: F811
+
+        perceptual_loss_fn = CLIPPerceptualLoss(
+            clip_encoder,
+            canvas_size=args.pixel_canvas_size,
+            num_augmentations=args.distill_augmentations,
+        )
+
     # Pick a few classes to visualize during training
     viz_classes = list(range(min(6, num_classes)))
     num_vis_per_class = 2
@@ -332,123 +401,197 @@ def train() -> None:
         num_batches = 0
 
         for batch in dataloader:
-            beziers = batch["beziers"]  # (B, 32, 4, 2)
-            B = beziers.shape[0]
-            x1 = beziers.view(B, 32, 8).to(device)  # flatten to (B, 32, 8)
-            labels = batch["label"].to(device)
-
-            x0 = torch.randn_like(x1)
-            t = torch.rand(B, 1, 1, device=device)
-            xt = (1 - t) * x0 + t * x1
-            v_target = x1 - x0
-
-            clip_features = None
-            cfg_mask = None
-            if clip_encoder is not None:
+            if args.distill:
+                # --- Distillation training loop ---
                 images = batch["image"].to(device)  # (B, 3, 224, 224)
-                clip_features = clip_encoder(images)  # (B, 50, 768)
-                cfg_mask = torch.rand(B, device=device) < args.p_uncond  # (B,) bool
+                B = images.shape[0]
 
-            v_pred = model(xt, t.squeeze(-1).squeeze(-1), labels, clip_features=clip_features, cfg_mask=cfg_mask)
-
-            loss_velocity = F.mse_loss(v_pred, v_target)
-            loss = args.velocity_loss_weight * loss_velocity
-
-            # One-step denoised estimate (shared by all aux losses)
-            needs_x1_hat = use_geo or use_pixel or use_lpips or use_aesthetic or use_plotter
-            if needs_x1_hat:
-                x1_hat = xt + (1.0 - t) * v_pred  # (B, 32, 8)
-                x1_hat_beziers = x1_hat.view(B, 32, 4, 2)
-
-            # Geometric losses (full batch, cheap)
-            geo_logs: dict[str, float] = {}
-            if use_geo:
-                loss_geo, geo_logs = compute_geometric_losses(
-                    x1_hat_beziers,
-                    w_smoothness=args.smoothness_loss_weight,
-                    w_degenerate=args.degenerate_loss_weight,
-                    w_coverage=args.coverage_loss_weight,
-                )
-                loss = loss + loss_geo
-
-            # Pixel + LPIPS losses (subset of batch, expensive)
-            loss_pixel = torch.tensor(0.0, device=device)
-            loss_lpips = torch.tensor(0.0, device=device)
-            if use_pixel or use_lpips:
-                K = min(B, args.pixel_batch_size)
-                rendered_pred = render_batch_beziers(
-                    x1_hat_beziers[:K],
-                    canvas_size=args.pixel_canvas_size,
-                    max_render=K,
-                )
+                # Encode target images (no gradients — conditioning only)
                 with torch.no_grad():
-                    rendered_target = render_batch_beziers(
-                        x1[:K].view(-1, 32, 4, 2),
+                    target_clip = clip_encoder(images)  # (B, 50, 768)
+
+                # ODE integration WITH gradients (few steps, cheap)
+                x = torch.randn(B, 32, 8, device=device)
+                dummy_labels = torch.zeros(B, dtype=torch.long, device=device)
+                dt = 1.0 / args.distill_ode_steps
+                for step in range(args.distill_ode_steps):
+                    t_val = torch.full((B,), step * dt, device=device)
+                    v = model(x, t_val, dummy_labels, clip_features=target_clip)
+                    x = x + v * dt
+
+                # Perceptual loss on rendered subset
+                K = min(B, args.pixel_batch_size)
+                beziers_out = x[:K].view(K, 32, 4, 2)
+                loss_clip, clip_logs = perceptual_loss_fn(beziers_out, target_clip[:K])
+                loss = loss_clip
+
+                # Geometric losses on generated beziers (optional, cheap)
+                geo_logs: dict[str, float] = {}
+                if use_geo:
+                    loss_geo, geo_logs = compute_geometric_losses(
+                        beziers_out,
+                        w_smoothness=args.smoothness_loss_weight,
+                        w_degenerate=args.degenerate_loss_weight,
+                        w_coverage=args.coverage_loss_weight,
+                    )
+                    loss = loss + loss_geo
+
+                # Plotter regularization losses (optional)
+                plotter_logs: dict[str, float] = {}
+                if use_plotter:
+                    loss_plotter, plotter_logs = compute_plotter_losses(
+                        beziers_out,
+                        density_weight=args.density_loss_weight,
+                        curvature_weight=args.curvature_loss_weight,
+                        length_weight=args.length_loss_weight,
+                        uniformity_weight=args.uniformity_loss_weight,
+                        density_grid_size=args.density_grid_size,
+                        density_threshold=args.density_threshold,
+                    )
+                    loss = loss + loss_plotter
+
+                optimizer.zero_grad()
+                loss.backward()
+                grad_norm = nn_utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                optimizer.step()
+                if ema is not None:
+                    ema.update()
+
+                loss_velocity = torch.tensor(0.0)
+                loss_pixel = torch.tensor(0.0)
+
+                if wandb_run:
+                    import wandb
+
+                    metrics = {
+                        "loss/total": loss.item(),
+                        "grad_norm": grad_norm.item(),
+                        "lr": optimizer.param_groups[0]["lr"],
+                    }
+                    metrics.update(clip_logs)
+                    metrics.update(geo_logs)
+                    metrics.update(plotter_logs)
+                    wandb.log(metrics, step=global_step)
+            else:
+                # --- Standard velocity MSE training loop ---
+                beziers = batch["beziers"]  # (B, 32, 4, 2)
+                B = beziers.shape[0]
+                x1 = beziers.view(B, 32, 8).to(device)  # flatten to (B, 32, 8)
+                labels = batch["label"].to(device)
+
+                x0 = torch.randn_like(x1)
+                t = torch.rand(B, 1, 1, device=device)
+                xt = (1 - t) * x0 + t * x1
+                v_target = x1 - x0
+
+                clip_features = None
+                cfg_mask = None
+                if clip_encoder is not None:
+                    images = batch["image"].to(device)  # (B, 3, 224, 224)
+                    with torch.no_grad():
+                        clip_features = clip_encoder(images)  # (B, 50, 768)
+                    cfg_mask = torch.rand(B, device=device) < args.p_uncond  # (B,) bool
+
+                v_pred = model(xt, t.squeeze(-1).squeeze(-1), labels, clip_features=clip_features, cfg_mask=cfg_mask)
+
+                loss_velocity = F.mse_loss(v_pred, v_target)
+                loss = args.velocity_loss_weight * loss_velocity
+
+                # One-step denoised estimate (shared by all aux losses)
+                needs_x1_hat = use_geo or use_pixel or use_lpips or use_aesthetic or use_plotter
+                if needs_x1_hat:
+                    x1_hat = xt + (1.0 - t) * v_pred  # (B, 32, 8)
+                    x1_hat_beziers = x1_hat.view(B, 32, 4, 2)
+
+                # Geometric losses (full batch, cheap)
+                geo_logs: dict[str, float] = {}
+                if use_geo:
+                    loss_geo, geo_logs = compute_geometric_losses(
+                        x1_hat_beziers,
+                        w_smoothness=args.smoothness_loss_weight,
+                        w_degenerate=args.degenerate_loss_weight,
+                        w_coverage=args.coverage_loss_weight,
+                    )
+                    loss = loss + loss_geo
+
+                # Pixel + LPIPS losses (subset of batch, expensive)
+                loss_pixel = torch.tensor(0.0, device=device)
+                loss_lpips = torch.tensor(0.0, device=device)
+                if use_pixel or use_lpips:
+                    K = min(B, args.pixel_batch_size)
+                    rendered_pred = render_batch_beziers(
+                        x1_hat_beziers[:K],
                         canvas_size=args.pixel_canvas_size,
                         max_render=K,
                     )
-                if use_pixel:
-                    loss_pixel = F.mse_loss(rendered_pred, rendered_target)
-                    loss = loss + args.pixel_loss_weight * loss_pixel
-                if use_lpips:
-                    loss_lpips = lpips_fn(rendered_pred, rendered_target)
-                    loss = loss + args.lpips_loss_weight * loss_lpips
+                    with torch.no_grad():
+                        rendered_target = render_batch_beziers(
+                            x1[:K].view(-1, 32, 4, 2),
+                            canvas_size=args.pixel_canvas_size,
+                            max_render=K,
+                        )
+                    if use_pixel:
+                        loss_pixel = F.mse_loss(rendered_pred, rendered_target)
+                        loss = loss + args.pixel_loss_weight * loss_pixel
+                    if use_lpips:
+                        loss_lpips = lpips_fn(rendered_pred, rendered_target)
+                        loss = loss + args.lpips_loss_weight * loss_lpips
 
-            # Aesthetic loss (subset of batch, expensive)
-            loss_aesthetic = torch.tensor(0.0, device=device)
-            aes_scores = None
-            if use_aesthetic and global_step % args.aesthetic_every == 0:
-                K_aes = min(B, args.aesthetic_batch_size)
-                rendered_aes = render_batch_beziers(
-                    x1_hat_beziers[:K_aes],
-                    canvas_size=224,
-                    max_render=K_aes,
-                )
-                loss_aesthetic, aes_scores = aesthetic_scorer.compute_loss(rendered_aes)
-                loss = loss + args.aesthetic_loss_weight * loss_aesthetic
+                # Aesthetic loss (subset of batch, expensive)
+                loss_aesthetic = torch.tensor(0.0, device=device)
+                aes_scores = None
+                if use_aesthetic and global_step % args.aesthetic_every == 0:
+                    K_aes = min(B, args.aesthetic_batch_size)
+                    rendered_aes = render_batch_beziers(
+                        x1_hat_beziers[:K_aes],
+                        canvas_size=224,
+                        max_render=K_aes,
+                    )
+                    loss_aesthetic, aes_scores = aesthetic_scorer.compute_loss(rendered_aes)
+                    loss = loss + args.aesthetic_loss_weight * loss_aesthetic
 
-            # Plotter regularization losses (full batch, moderate cost)
-            plotter_logs: dict[str, float] = {}
-            if use_plotter:
-                loss_plotter, plotter_logs = compute_plotter_losses(
-                    x1_hat_beziers,
-                    density_weight=args.density_loss_weight,
-                    curvature_weight=args.curvature_loss_weight,
-                    length_weight=args.length_loss_weight,
-                    uniformity_weight=args.uniformity_loss_weight,
-                    density_grid_size=args.density_grid_size,
-                    density_threshold=args.density_threshold,
-                )
-                loss = loss + loss_plotter
+                # Plotter regularization losses (full batch, moderate cost)
+                plotter_logs: dict[str, float] = {}
+                if use_plotter:
+                    loss_plotter, plotter_logs = compute_plotter_losses(
+                        x1_hat_beziers,
+                        density_weight=args.density_loss_weight,
+                        curvature_weight=args.curvature_loss_weight,
+                        length_weight=args.length_loss_weight,
+                        uniformity_weight=args.uniformity_loss_weight,
+                        density_grid_size=args.density_grid_size,
+                        density_threshold=args.density_threshold,
+                    )
+                    loss = loss + loss_plotter
 
-            optimizer.zero_grad()
-            loss.backward()
-            grad_norm = nn_utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-            optimizer.step()
-            if ema is not None:
-                ema.update()
+                optimizer.zero_grad()
+                loss.backward()
+                grad_norm = nn_utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                optimizer.step()
+                if ema is not None:
+                    ema.update()
 
-            if wandb_run:
-                import wandb
+                if wandb_run:
+                    import wandb
 
-                metrics = {
-                    "loss/total": loss.item(),
-                    "loss/velocity": loss_velocity.item(),
-                    "grad_norm": grad_norm.item(),
-                    "lr": optimizer.param_groups[0]["lr"],
-                }
-                metrics.update(geo_logs)
-                metrics.update(plotter_logs)
-                if use_pixel:
-                    metrics["loss/pixel"] = loss_pixel.item()
-                if use_lpips:
-                    metrics["loss/lpips"] = loss_lpips.item()
-                if use_aesthetic:
-                    metrics["loss/aesthetic"] = loss_aesthetic.item()
-                    if aes_scores is not None:
-                        metrics["aesthetic/score_mean"] = aes_scores.mean().item()
-                        metrics["aesthetic/score_std"] = aes_scores.std().item()
-                wandb.log(metrics, step=global_step)
+                    metrics = {
+                        "loss/total": loss.item(),
+                        "loss/velocity": loss_velocity.item(),
+                        "grad_norm": grad_norm.item(),
+                        "lr": optimizer.param_groups[0]["lr"],
+                    }
+                    metrics.update(geo_logs)
+                    metrics.update(plotter_logs)
+                    if use_pixel:
+                        metrics["loss/pixel"] = loss_pixel.item()
+                    if use_lpips:
+                        metrics["loss/lpips"] = loss_lpips.item()
+                    if use_aesthetic:
+                        metrics["loss/aesthetic"] = loss_aesthetic.item()
+                        if aes_scores is not None:
+                            metrics["aesthetic/score_mean"] = aes_scores.mean().item()
+                            metrics["aesthetic/score_std"] = aes_scores.std().item()
+                    wandb.log(metrics, step=global_step)
 
             epoch_loss += loss.item()
             epoch_vel += loss_velocity.item()
@@ -539,7 +682,7 @@ def train() -> None:
                     "num_heads": args.num_heads,
                     "dropout": args.dropout,
                     "num_classes": num_classes,
-                    "categories": dataset.categories,
+                    "categories": categories,
                     "clip_dim": clip_dim,
                 },
             }
@@ -565,7 +708,7 @@ def train() -> None:
             "num_heads": args.num_heads,
             "dropout": args.dropout,
             "num_classes": num_classes,
-            "categories": dataset.categories,
+            "categories": categories,
             "clip_dim": clip_dim,
         },
     }
