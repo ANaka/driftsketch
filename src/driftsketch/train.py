@@ -273,12 +273,15 @@ def train() -> None:
         collate_fn=collate_fn,
     )
 
-    # --- Output directory ---
+    # --- Run name and output directory ---
     if wandb_run:
-        output_dir = os.path.join("outputs", "training", wandb_run.id)
+        run_name = wandb_run.name
     else:
-        output_dir = os.path.join("outputs", "training", "local")
+        run_name = "local"
+    output_dir = os.path.join("outputs", "training", run_name)
     os.makedirs(output_dir, exist_ok=True)
+    checkpoint_dir = os.path.join(args.checkpoint_dir, run_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
     # --- Checkpoint loading ---
     checkpoint_data = None
@@ -666,8 +669,8 @@ def train() -> None:
 
         # --- Periodic checkpoint saving ---
         if args.save_every > 0 and epoch % args.save_every == 0 and epoch < args.epochs:
-            os.makedirs(args.checkpoint_dir, exist_ok=True)
-            periodic_path = os.path.join(args.checkpoint_dir, f"model_epoch_{epoch:04d}.pt")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            periodic_path = os.path.join(checkpoint_dir, f"model_epoch_{epoch:04d}.pt")
             ckpt_data = {
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -692,8 +695,8 @@ def train() -> None:
             print(f"  Saved periodic checkpoint to {periodic_path}")
 
     # --- Save final checkpoint ---
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    checkpoint_path = os.path.join(args.checkpoint_dir, "model.pt")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    checkpoint_path = os.path.join(checkpoint_dir, "model.pt")
     ckpt_data = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
