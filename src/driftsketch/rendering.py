@@ -4,7 +4,6 @@ Renders Bezier stroke sketches to raster images with full gradient support.
 """
 
 import torch
-import pydiffvg
 
 
 def render_beziers_differentiable(
@@ -24,6 +23,8 @@ def render_beziers_differentiable(
     Returns:
         (H, W) grayscale image tensor -- white background (1.0), black strokes (0.0).
     """
+    import pydiffvg
+
     num_strokes = beziers.shape[0]
 
     # Map from [-1, 1] to [0, canvas_size]

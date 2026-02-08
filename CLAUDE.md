@@ -8,21 +8,42 @@ When you make a mistake or learn a lesson during development, record it in MEMOR
 
 ## Project Overview
 
-DriftSketch is a Conditional Flow Matching (CFM) model for vector sketch generation. It uses a Transformer architecture to learn velocity fields that transform Gaussian noise into structured 2D point sequences, conditioned on class labels. Currently trained on Google QuickDraw data (10 categories, up to 5000 samples each).
+DriftSketch is a Conditional Flow Matching (CFM) model for vector sketch generation. It uses Transformer architectures (decoder or DiT) to learn velocity fields that transform Gaussian noise into 32 cubic Bezier strokes, conditioned on class labels or CLIP image embeddings. Primarily trained on ControlSketch (SwiftSketch) data.
 
 ## Commands
 
 ```bash
 # Install (editable, uses hatch build backend)
-pip install -e .
+uv pip install -e .
 
-# Train (uses wandb for logging)
-driftsketch-train --epochs 1000 --batch-size 64 --lr 1e-4 --checkpoint-dir checkpoints
+# Install with all optional deps
+uv pip install -e ".[all]"
+
+# Train on ControlSketch data
+driftsketch-train --data-dir data/raw/controlsketch --epochs 500 --batch-size 64
+
+# Train with DiT architecture
+driftsketch-train --data-dir data/raw/controlsketch --model-type dit --epochs 500
+
+# Train with CLIP conditioning
+driftsketch-train --data-dir data/raw/controlsketch --use-clip --p-uncond 0.1
+
+# Perceptual distillation (fine-tune on arbitrary images, no paired sketches needed)
+driftsketch-train --distill --checkpoint checkpoints/model.pt --distill-image-dir /path/to/images --use-clip
+
+# Resume training from a checkpoint
+driftsketch-train --data-dir data/raw/controlsketch --checkpoint checkpoints/model.pt --epochs 500
 
 # Generate sketches from a checkpoint
-driftsketch-generate --checkpoint checkpoints/model.pt --num-samples 8 --output outputs/generated.png
+driftsketch-generate --checkpoint checkpoints/model.pt --class-label 0 --num-samples 8
 
-# Download QuickDraw raw data
+# Generate from image with classifier-free guidance
+driftsketch-generate --checkpoint checkpoints/model.pt --class-label 0 --image photo.jpg --cfg-scale 3.0
+
+# Export SVG
+driftsketch-generate --checkpoint checkpoints/model.pt --class-label 0 --export-svg output.svg
+
+# Download QuickDraw raw data (legacy)
 python scripts/download_quickdraw.py --categories cat car house --max-per-category 5000
 
 # Can also run as modules
@@ -41,30 +62,61 @@ The core flow: **noise (x0) -> interpolate with target (xt) -> predict velocity 
 1. **Training (`train.py`):** Samples x0 ~ N(0,I) and x1 from data, interpolates xt = (1-t)*x0 + t*x1, trains model to predict velocity v = x1 - x0
 2. **Inference (`inference.py`):** Starts from noise, integrates the learned velocity field via Euler ODE solver (50 steps, t=0 to t=1)
 
-### Model (`model.py` - `VectorSketchTransformer`)
+### Models
 
-Token layout: `[time_token, class_token, point_1, ..., point_N]` (N+2 total tokens)
+Two architectures are available (`--model-type`):
 
-- Point embedding: Linear(2 -> 128) + learnable positional encoding
-- Time embedding: sinusoidal features -> MLP with SiLU
-- Class embedding: nn.Embedding -> MLP with SiLU
-- Backbone: 6-layer TransformerEncoder (pre-LN, GELU, 4 heads)
-- Output: extracts last N tokens (points only), LayerNorm -> Linear -> (B, N, 2)
+- **`decoder`** (default) — `BezierSketchTransformer` in `model.py`: TransformerDecoder with cross-attention to conditioning memory tokens (class or CLIP). 256d, 8 heads, 8 layers.
+- **`dit`** — `BezierSketchDiT` in `dit.py`: adaLN-Zero Diffusion Transformer. Conditioning fused into a single vector that modulates every layer via adaptive layer norm. SwiGLU feed-forward, zero-initialized gates.
+
+Both operate on flattened Bezier strokes (B, 32, 8) and share the same forward signature.
+
+Legacy: `VectorSketchTransformer` in `model.py` operates on (B, N, 2) point sequences with token layout `[time_token, class_token, point_1, ..., point_N]`.
+
+### Training Modes
+
+1. **Standard** (default): Velocity MSE on ControlSketch paired data.
+2. **Distillation** (`--distill`): Fine-tunes pretrained model on arbitrary images via CLIP perceptual loss. Renders generated Beziers, augments (CLIPDraw-style), computes cosine similarity in CLIP space. Requires `--checkpoint`, `--use-clip`, `--distill-image-dir`. Fresh optimizer, few-step ODE with gradients.
 
 ### Data Pipeline (`data/`)
 
-Two data paths exist:
+- **ControlSketch** (`data/controlsketch.py`): Primary dataset. Loads paired image + SVG Bezier sketches from .npz files. Native format: (32, 4, 2) control points. Supports train/val/test splits.
+- **ImageDataset** (`data/images.py`): Unlabeled image directory for distillation. Recursively finds JPG/PNG files.
+- **QuickDraw** (`data/dataset.py`): Legacy. Loads .ndjson files, processes strokes to fixed-length polylines via arc-length resampling, caches as .npy.
+- **Processing** (`data/processing.py`): `strokes_to_points()` with arc-length resampling and normalization to [-1, 1].
 
-1. **Synthetic (`train.py:generate_batch`):** Generates circles (label 0) and squares (label 1) procedurally. Used for initial testing.
-2. **QuickDraw (`data/dataset.py:QuickDrawDataset`):** PyTorch Dataset loading real sketches from .ndjson files. Processes strokes to fixed-length point sequences via arc-length resampling (`data/processing.py:strokes_to_points`), normalizes to [-1, 1], caches as .npy files in `data/processed/`.
+### Loss Functions
 
-The QuickDraw dataset auto-discovers categories from `data/raw/quickdraw/*.ndjson` files if none specified. Label mapping is alphabetical by category name.
+All auxiliary losses operate on the one-step denoised estimate: `x1_hat = x_t + (1-t) * v_pred`.
+
+- **Core** (`train.py`): velocity MSE
+- **Geometric** (`losses.py`): smoothness, degenerate stroke penalty, coverage uniformity
+- **Perceptual** (`losses.py`): LPIPS
+- **Pixel** (`rendering.py`): differentiable rendering via pydiffvg, pixel MSE against target
+- **Aesthetic** (`aesthetic.py`): LAION aesthetic predictor (CLIP ViT-L/14 + MLP)
+- **Plotter** (`plotter_losses.py`): line density, curvature, total length, spatial uniformity
+- **CLIP perceptual** (`perceptual.py`): render + augment + CLIP cosine similarity (distillation mode)
+
+### Key Modules
+
+| Module | Purpose |
+|--------|---------|
+| `model.py` | VectorSketchTransformer, BezierSketchTransformer, CLIPImageProjector |
+| `dit.py` | BezierSketchDiT, DiTBlock, AdaLNModulation, SwiGLUFeedForward |
+| `train.py` | Training loop (standard + distillation), all losses, scheduler, EMA |
+| `perceptual.py` | CLIPPerceptualLoss (render → augment → CLIP cosine similarity) |
+| `inference.py` | Euler ODE generation, visualization, SVG export |
+| `clip_encoder.py` | Frozen CLIP ViT-B-32 patch-level feature extraction |
+| `rendering.py` | Differentiable Bezier → raster via pydiffvg |
+| `ema.py` | Exponential moving average of model weights |
 
 ### Key Conventions
 
-- All point data is shaped `(B, num_points, 2)` with values in [-1, 1]
+- Bezier data shaped `(B, 32, 4, 2)` or flattened `(B, 32, 8)`, values in [-1, 1]
+- Point data shaped `(B, num_points, 2)` with values in [-1, 1]
 - Time values are scalars in [0, 1]
 - Class labels are integer tensors
-- Default num_points=64, embed_dim=128
-- Checkpoints saved as `model.state_dict()` dicts
-- wandb is a hard dependency in the training loop (initialized unconditionally)
+- Checkpoints are dicts with `model_state_dict`, `ema_state_dict`, `config`; can be loaded to resume training or bootstrap distillation
+- wandb is optional (`--no-wandb` flag)
+- Training uses AdamW with cosine LR schedule (linear warmup) and EMA
+- Always use `uv` for package management, never bare `pip`
