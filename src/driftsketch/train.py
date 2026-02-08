@@ -1,6 +1,7 @@
 """Training pipeline for Conditional Flow Matching Bezier sketch generation."""
 
 import argparse
+import math
 import os
 
 import matplotlib.pyplot as plt
@@ -11,6 +12,8 @@ import torch.nn.utils as nn_utils
 from torch.utils.data import DataLoader
 
 from driftsketch.data.controlsketch import ControlSketchDataset
+from driftsketch.dit import BezierSketchDiT
+from driftsketch.ema import EMA
 from driftsketch.model import BezierSketchTransformer
 
 
@@ -106,6 +109,29 @@ def train() -> None:
     parser.add_argument("--lpips-loss-weight", type=float, default=0.0, help="Weight for LPIPS perceptual loss")
     parser.add_argument("--pixel-batch-size", type=int, default=4, help="How many samples to render per batch")
     parser.add_argument("--pixel-canvas-size", type=int, default=128, help="Canvas size for differentiable rendering")
+    parser.add_argument("--aesthetic-loss-weight", type=float, default=0.0, help="Weight for aesthetic loss")
+    parser.add_argument("--aesthetic-batch-size", type=int, default=4, help="How many samples to score per batch")
+    parser.add_argument("--aesthetic-every", type=int, default=1, help="Apply aesthetic loss every N steps")
+    parser.add_argument("--aesthetic-model-path", type=str, default=None, help="Path to aesthetic MLP weights (auto-downloads if None)")
+    parser.add_argument("--density-loss-weight", type=float, default=0.0, help="Penalize local line overlap (>0)")
+    parser.add_argument("--curvature-loss-weight", type=float, default=0.0, help="Penalize sharp turns (>0)")
+    parser.add_argument("--length-loss-weight", type=float, default=0.0, help="Penalize total arc length (>0), reward (<0)")
+    parser.add_argument("--uniformity-loss-weight", type=float, default=0.0, help="Penalize spatial spread (>0), reward (<0)")
+    parser.add_argument("--density-grid-size", type=int, default=32, help="Grid resolution for density loss")
+    parser.add_argument("--density-threshold", type=float, default=3.0, help="Density threshold before penalty")
+    # Training recipe
+    parser.add_argument("--weight-decay", type=float, default=0.05, help="AdamW weight decay")
+    parser.add_argument("--warmup-epochs", type=int, default=None, help="Linear warmup epochs (default: 5%% of total)")
+    parser.add_argument("--min-lr-factor", type=float, default=0.01, help="Cosine decay min LR as fraction of base")
+    parser.add_argument("--use-ema", action="store_true", help="Enable EMA of model weights")
+    parser.add_argument("--ema-decay", type=float, default=0.9999, help="EMA decay rate")
+    parser.add_argument("--save-every", type=int, default=0, help="Save checkpoint every N epochs (0=end only)")
+    # Architecture
+    parser.add_argument("--model-type", type=str, default="decoder", choices=["decoder", "dit"], help="Model architecture")
+    parser.add_argument("--embed-dim", type=int, default=256, help="Embedding dimension")
+    parser.add_argument("--num-layers", type=int, default=8, help="Number of transformer layers")
+    parser.add_argument("--num-heads", type=int, default=8, help="Number of attention heads")
+    parser.add_argument("--dropout", type=float, default=0.0, help="Dropout rate")
     args = parser.parse_args()
 
     # --- wandb setup ---
@@ -122,6 +148,14 @@ def train() -> None:
                 "max_grad_norm": args.max_grad_norm,
                 "dataset": "controlsketch",
                 "split": args.split,
+                "model_type": args.model_type,
+                "embed_dim": args.embed_dim,
+                "num_layers": args.num_layers,
+                "num_heads": args.num_heads,
+                "dropout": args.dropout,
+                "weight_decay": args.weight_decay,
+                "use_ema": args.use_ema,
+                "ema_decay": args.ema_decay,
             },
         )
 
@@ -174,6 +208,15 @@ def train() -> None:
             "lpips_loss_weight": args.lpips_loss_weight,
             "pixel_batch_size": args.pixel_batch_size,
             "pixel_canvas_size": args.pixel_canvas_size,
+            "aesthetic_loss_weight": args.aesthetic_loss_weight,
+            "aesthetic_batch_size": args.aesthetic_batch_size,
+            "aesthetic_every": args.aesthetic_every,
+            "density_loss_weight": args.density_loss_weight,
+            "curvature_loss_weight": args.curvature_loss_weight,
+            "length_loss_weight": args.length_loss_weight,
+            "uniformity_loss_weight": args.uniformity_loss_weight,
+            "density_grid_size": args.density_grid_size,
+            "density_threshold": args.density_threshold,
         })
         wandb.config.update(wandb_config_update)
 
@@ -201,18 +244,63 @@ def train() -> None:
     os.makedirs(output_dir, exist_ok=True)
 
     # --- Model ---
-    model = BezierSketchTransformer(num_classes=num_classes, clip_dim=clip_dim).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    model_kwargs = dict(
+        num_classes=num_classes,
+        clip_dim=clip_dim,
+        embed_dim=args.embed_dim,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+    )
+    if args.model_type == "dit":
+        model = BezierSketchDiT(**model_kwargs, dropout=args.dropout).to(device)
+    else:
+        model = BezierSketchTransformer(**model_kwargs).to(device)
+
+    # Separate param groups: no weight decay on biases, norms, embeddings
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim <= 1 or "bias" in name or "embedding" in name or "embed" in name or "pos_encoding" in name or "null_" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+    optimizer = torch.optim.AdamW([
+        {"params": decay_params, "weight_decay": args.weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ], lr=args.lr)
+
+    # --- LR scheduler: linear warmup + cosine decay ---
+    warmup_epochs = args.warmup_epochs if args.warmup_epochs is not None else max(1, args.epochs // 20)
+    total_epochs = args.epochs
+
+    def lr_lambda(epoch: int) -> float:
+        if epoch < warmup_epochs:
+            return (epoch + 1) / warmup_epochs
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        return args.min_lr_factor + (1.0 - args.min_lr_factor) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # --- EMA ---
+    ema = EMA(model, decay=args.ema_decay) if args.use_ema else None
 
     # --- Auxiliary losses setup ---
     use_geo = args.smoothness_loss_weight > 0 or args.degenerate_loss_weight > 0 or args.coverage_loss_weight > 0
     use_pixel = args.pixel_loss_weight > 0
     use_lpips = args.lpips_loss_weight > 0
 
+    use_aesthetic = args.aesthetic_loss_weight > 0
+    use_plotter = any(w != 0 for w in [
+        args.density_loss_weight, args.curvature_loss_weight,
+        args.length_loss_weight, args.uniformity_loss_weight,
+    ])
+
     if use_geo:
         from driftsketch.losses import compute_geometric_losses
 
-    if use_pixel or use_lpips:
+    if use_pixel or use_lpips or use_aesthetic:
         from driftsketch.rendering import render_batch_beziers
 
     lpips_fn = None
@@ -220,6 +308,15 @@ def train() -> None:
         from driftsketch.losses import LPIPSLoss
 
         lpips_fn = LPIPSLoss().to(device)
+
+    if use_plotter:
+        from driftsketch.plotter_losses import compute_plotter_losses
+
+    aesthetic_scorer = None
+    if use_aesthetic:
+        from driftsketch.aesthetic import AestheticScorer
+
+        aesthetic_scorer = AestheticScorer(model_path=args.aesthetic_model_path, device=device)
 
     # Pick a few classes to visualize during training
     viz_classes = list(range(min(6, num_classes)))
@@ -258,7 +355,7 @@ def train() -> None:
             loss = args.velocity_loss_weight * loss_velocity
 
             # One-step denoised estimate (shared by all aux losses)
-            needs_x1_hat = use_geo or use_pixel or use_lpips
+            needs_x1_hat = use_geo or use_pixel or use_lpips or use_aesthetic or use_plotter
             if needs_x1_hat:
                 x1_hat = xt + (1.0 - t) * v_pred  # (B, 32, 8)
                 x1_hat_beziers = x1_hat.view(B, 32, 4, 2)
@@ -297,10 +394,39 @@ def train() -> None:
                     loss_lpips = lpips_fn(rendered_pred, rendered_target)
                     loss = loss + args.lpips_loss_weight * loss_lpips
 
+            # Aesthetic loss (subset of batch, expensive)
+            loss_aesthetic = torch.tensor(0.0, device=device)
+            aes_scores = None
+            if use_aesthetic and global_step % args.aesthetic_every == 0:
+                K_aes = min(B, args.aesthetic_batch_size)
+                rendered_aes = render_batch_beziers(
+                    x1_hat_beziers[:K_aes],
+                    canvas_size=224,
+                    max_render=K_aes,
+                )
+                loss_aesthetic, aes_scores = aesthetic_scorer.compute_loss(rendered_aes)
+                loss = loss + args.aesthetic_loss_weight * loss_aesthetic
+
+            # Plotter regularization losses (full batch, moderate cost)
+            plotter_logs: dict[str, float] = {}
+            if use_plotter:
+                loss_plotter, plotter_logs = compute_plotter_losses(
+                    x1_hat_beziers,
+                    density_weight=args.density_loss_weight,
+                    curvature_weight=args.curvature_loss_weight,
+                    length_weight=args.length_loss_weight,
+                    uniformity_weight=args.uniformity_loss_weight,
+                    density_grid_size=args.density_grid_size,
+                    density_threshold=args.density_threshold,
+                )
+                loss = loss + loss_plotter
+
             optimizer.zero_grad()
             loss.backward()
             grad_norm = nn_utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
+            if ema is not None:
+                ema.update()
 
             if wandb_run:
                 import wandb
@@ -309,12 +435,19 @@ def train() -> None:
                     "loss/total": loss.item(),
                     "loss/velocity": loss_velocity.item(),
                     "grad_norm": grad_norm.item(),
+                    "lr": optimizer.param_groups[0]["lr"],
                 }
                 metrics.update(geo_logs)
+                metrics.update(plotter_logs)
                 if use_pixel:
                     metrics["loss/pixel"] = loss_pixel.item()
                 if use_lpips:
                     metrics["loss/lpips"] = loss_lpips.item()
+                if use_aesthetic:
+                    metrics["loss/aesthetic"] = loss_aesthetic.item()
+                    if aes_scores is not None:
+                        metrics["aesthetic/score_mean"] = aes_scores.mean().item()
+                        metrics["aesthetic/score_std"] = aes_scores.std().item()
                 wandb.log(metrics, step=global_step)
 
             epoch_loss += loss.item()
