@@ -11,11 +11,12 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from driftsketch.dit import BezierSketchDiT
 from driftsketch.model import BezierSketchTransformer
 
 
 def generate_beziers(
-    model: BezierSketchTransformer,
+    model: BezierSketchTransformer | BezierSketchDiT,
     class_label: int,
     num_samples: int,
     num_steps: int = 50,
@@ -265,16 +266,39 @@ def main() -> None:
         clip_dim = 0
         clip_features = None
 
-    # Load checkpoint — support both old format (raw state_dict) and new format
+    # Load checkpoint — support old format (raw state_dict) and new format with model type
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         config = ckpt.get("config", {})
         num_classes = config.get("num_classes", args.num_classes)
         ckpt_clip_dim = config.get("clip_dim", 0)
-        # Use clip_dim from CLI if --image provided, else from checkpoint
         final_clip_dim = clip_dim if args.image else ckpt_clip_dim
-        model = BezierSketchTransformer(num_classes=num_classes, clip_dim=final_clip_dim)
-        model.load_state_dict(ckpt["model_state_dict"])
+        model_type = config.get("model_type", "decoder")
+
+        model_kwargs = dict(
+            num_classes=num_classes,
+            clip_dim=final_clip_dim,
+            embed_dim=config.get("embed_dim", 256),
+            num_heads=config.get("num_heads", 8),
+            num_layers=config.get("num_layers", 8),
+        )
+        if model_type == "dit":
+            model = BezierSketchDiT(**model_kwargs, dropout=config.get("dropout", 0.0))
+        else:
+            model = BezierSketchTransformer(**model_kwargs)
+
+        # Prefer EMA weights if available
+        if "ema_state_dict" in ckpt:
+            ema_sd = ckpt["ema_state_dict"]
+            model_sd = ckpt["model_state_dict"]
+            # EMA state_dict has same keys as model params — load into model
+            for k in ema_sd:
+                if k in model_sd:
+                    model_sd[k] = ema_sd[k]
+            model.load_state_dict(model_sd)
+        else:
+            model.load_state_dict(ckpt["model_state_dict"])
+        print(f"Loaded {model_type} model from {args.checkpoint}")
     else:
         final_clip_dim = clip_dim if args.image else 0
         model = BezierSketchTransformer(num_classes=args.num_classes, clip_dim=final_clip_dim)

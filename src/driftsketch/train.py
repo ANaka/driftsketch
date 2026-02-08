@@ -456,10 +456,13 @@ def train() -> None:
             num_batches += 1
             global_step += 1
 
+        scheduler.step()
+
         avg_loss = epoch_loss / max(num_batches, 1)
         avg_vel = epoch_vel / max(num_batches, 1)
         avg_pix = epoch_pix / max(num_batches, 1)
-        print(f"Epoch {epoch}/{args.epochs}  avg_loss={avg_loss:.6f}  avg_vel={avg_vel:.6f}  avg_pix={avg_pix:.6f}")
+        cur_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch {epoch}/{args.epochs}  avg_loss={avg_loss:.6f}  avg_vel={avg_vel:.6f}  avg_pix={avg_pix:.6f}  lr={cur_lr:.2e}")
 
         if wandb_run:
             import wandb
@@ -470,6 +473,8 @@ def train() -> None:
         is_sample_epoch = epoch % args.sample_every == 0 or epoch == args.epochs
         if is_sample_epoch:
             model.eval()
+            if ema is not None:
+                ema.apply()
             num_vis = num_vis_per_class * len(viz_classes)
             vis_labels = torch.tensor(
                 [c for c in viz_classes for _ in range(num_vis_per_class)],
@@ -513,25 +518,60 @@ def train() -> None:
                     step=global_step,
                 )
 
-    # --- Save checkpoint ---
+            if ema is not None:
+                ema.restore()
+
+        # --- Periodic checkpoint saving ---
+        if args.save_every > 0 and epoch % args.save_every == 0 and epoch < args.epochs:
+            os.makedirs(args.checkpoint_dir, exist_ok=True)
+            periodic_path = os.path.join(args.checkpoint_dir, f"model_epoch_{epoch:04d}.pt")
+            ckpt_data = {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "epoch": epoch,
+                "config": {
+                    "model_type": args.model_type,
+                    "num_strokes": 32,
+                    "coords_per_stroke": 8,
+                    "embed_dim": args.embed_dim,
+                    "num_layers": args.num_layers,
+                    "num_heads": args.num_heads,
+                    "dropout": args.dropout,
+                    "num_classes": num_classes,
+                    "categories": dataset.categories,
+                    "clip_dim": clip_dim,
+                },
+            }
+            if ema is not None:
+                ckpt_data["ema_state_dict"] = ema.state_dict()
+            torch.save(ckpt_data, periodic_path)
+            print(f"  Saved periodic checkpoint to {periodic_path}")
+
+    # --- Save final checkpoint ---
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     checkpoint_path = os.path.join(args.checkpoint_dir, "model.pt")
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "epoch": args.epochs,
-            "config": {
-                "num_strokes": 32,
-                "coords_per_stroke": 8,
-                "embed_dim": model.embed_dim,
-                "num_classes": num_classes,
-                "categories": dataset.categories,
-                "clip_dim": clip_dim,
-            },
+    ckpt_data = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "epoch": args.epochs,
+        "config": {
+            "model_type": args.model_type,
+            "num_strokes": 32,
+            "coords_per_stroke": 8,
+            "embed_dim": args.embed_dim,
+            "num_layers": args.num_layers,
+            "num_heads": args.num_heads,
+            "dropout": args.dropout,
+            "num_classes": num_classes,
+            "categories": dataset.categories,
+            "clip_dim": clip_dim,
         },
-        checkpoint_path,
-    )
+    }
+    if ema is not None:
+        ckpt_data["ema_state_dict"] = ema.state_dict()
+    torch.save(ckpt_data, checkpoint_path)
     print(f"Saved checkpoint to {checkpoint_path}")
 
     if wandb_run:
