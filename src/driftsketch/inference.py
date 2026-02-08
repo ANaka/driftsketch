@@ -1,4 +1,4 @@
-"""Inference pipeline: Euler ODE solver, visualisation, and SVG export for Bezier CFM sketches."""
+"""Inference pipeline: Euler ODE solver, visualisation, and SVG export for Bezier and line segment CFM sketches."""
 
 from __future__ import annotations
 
@@ -65,6 +65,53 @@ def generate_beziers(
     return x.view(num_samples, num_strokes, 4, 2)
 
 
+def generate_lines(
+    model: BezierSketchTransformer | BezierSketchDiT,
+    class_label: int,
+    num_samples: int,
+    num_steps: int = 50,
+    device: str = "cpu",
+    clip_features: Tensor | None = None,
+    cfg_scale: float = 1.0,
+) -> Tensor:
+    """Generate line segment sketches via Euler ODE integration.
+
+    Args:
+        model: A model already on *device* and in eval mode.
+        class_label: Class index to condition on.
+        num_samples: Number of sketches to produce.
+        num_steps: Number of Euler integration steps from t=0 to t=1.
+        device: Device string matching the model placement.
+        clip_features: Optional CLIP image features of shape ``(B, L, D)``.
+        cfg_scale: Classifier-free guidance scale (1.0 = no guidance).
+
+    Returns:
+        Tensor of shape ``(num_samples, num_strokes, 2, 2)`` — line segment endpoints.
+    """
+    num_strokes = model.pos_encoding.shape[1]
+    coords_per_stroke = model.stroke_proj.in_features
+    x = torch.randn(num_samples, num_strokes, coords_per_stroke, device=device)
+    dt = 1.0 / num_steps
+    labels = torch.full((num_samples,), class_label, dtype=torch.long, device=device)
+
+    for i in range(num_steps):
+        t_val = i * dt
+        t = torch.full((num_samples,), t_val, device=device)
+        with torch.no_grad():
+            if clip_features is not None and cfg_scale != 1.0:
+                v_cond = model(x, t, labels, clip_features=clip_features)
+                cfg_mask = torch.ones(num_samples, dtype=torch.bool, device=device)
+                v_uncond = model(x, t, labels, clip_features=clip_features, cfg_mask=cfg_mask)
+                v = v_uncond + cfg_scale * (v_cond - v_uncond)
+            elif clip_features is not None:
+                v = model(x, t, labels, clip_features=clip_features)
+            else:
+                v = model(x, t, labels)
+        x = x + v * dt
+
+    return x.view(num_samples, num_strokes, 2, 2)
+
+
 def plot_bezier_sketches(samples: Tensor, path: str, title: str | None = None) -> None:
     """Render generated Bezier stroke sketches in a grid and save to *path*.
 
@@ -111,6 +158,50 @@ def plot_bezier_sketches(samples: Tensor, path: str, title: str | None = None) -
             xs = curve[0].numpy()
             ys = curve[1].numpy()
             ax.plot(xs, ys, color="black", linewidth=0.8)
+        ax.invert_yaxis()
+
+    if title:
+        fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def plot_line_sketches(samples: Tensor, path: str, title: str | None = None) -> None:
+    """Render generated line segment sketches in a grid and save to *path*.
+
+    Args:
+        samples: ``(N, num_strokes, 2, 2)`` tensor of line segment endpoints.
+        path: Destination file path for the saved figure.
+        title: Optional title for the figure.
+    """
+    n = samples.shape[0]
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(2 * cols, 2 * rows))
+
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = axes.reshape(1, -1)
+    elif cols == 1:
+        axes = axes.reshape(-1, 1)
+
+    for idx in range(rows * cols):
+        r, c = divmod(idx, cols)
+        ax = axes[r, c]
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+        if idx >= n:
+            continue
+
+        lines = samples[idx].cpu()  # (num_strokes, 2, 2)
+        for seg in lines:
+            x1, y1 = seg[0, 0].item(), seg[0, 1].item()
+            x2, y2 = seg[1, 0].item(), seg[1, 1].item()
+            ax.plot([x1, x2], [y1, y2], color="black", linewidth=0.8)
         ax.invert_yaxis()
 
     if title:
@@ -179,6 +270,39 @@ def export_svg(beziers: Tensor, filename: str, canvas_size: int = 256) -> None:
     shapes, groups = beziers_to_pydiffvg_shapes(beziers, canvas_size)
     os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
     pydiffvg.save_svg(filename, canvas_size, canvas_size, shapes, groups)
+
+
+def export_svg_lines(lines: Tensor, filename: str, canvas_size: int = 256) -> None:
+    """Export a single sample's line segments as an SVG file.
+
+    Args:
+        lines: ``(num_strokes, 2, 2)`` single sample, values in [-1, 1].
+        filename: Output SVG file path.
+        canvas_size: Output canvas dimension in pixels.
+    """
+    # Map from [-1, 1] to [0, canvas_size]
+    lines_canvas = (lines.cpu().float() + 1) / 2 * canvas_size
+
+    svg_lines = []
+    for seg in lines_canvas:
+        x1, y1 = seg[0, 0].item(), seg[0, 1].item()
+        x2, y2 = seg[1, 0].item(), seg[1, 1].item()
+        svg_lines.append(
+            f'  <line x1="{x1:.2f}" y1="{y1:.2f}" x2="{x2:.2f}" y2="{y2:.2f}" '
+            f'stroke="black" stroke-width="2" stroke-linecap="round"/>'
+        )
+
+    svg_content = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'width="{canvas_size}" height="{canvas_size}" '
+        f'viewBox="0 0 {canvas_size} {canvas_size}">\n'
+        + "\n".join(svg_lines)
+        + "\n</svg>\n"
+    )
+
+    os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
+    with open(filename, "w") as f:
+        f.write(svg_content)
 
 
 def main() -> None:
@@ -274,8 +398,13 @@ def main() -> None:
         ckpt_clip_dim = config.get("clip_dim", 0)
         final_clip_dim = clip_dim if args.image else ckpt_clip_dim
         model_type = config.get("model_type", "decoder")
+        primitive_type = config.get("primitive_type", "bezier")
+        num_strokes = config.get("num_strokes", 32)
+        coords_per_stroke = config.get("coords_per_stroke", 8)
 
         model_kwargs = dict(
+            num_strokes=num_strokes,
+            coords_per_stroke=coords_per_stroke,
             num_classes=num_classes,
             clip_dim=final_clip_dim,
             embed_dim=config.get("embed_dim", 256),
@@ -298,17 +427,17 @@ def main() -> None:
             model.load_state_dict(model_sd)
         else:
             model.load_state_dict(ckpt["model_state_dict"])
-        print(f"Loaded {model_type} model from {args.checkpoint}")
+        print(f"Loaded {model_type} model ({primitive_type}) from {args.checkpoint}")
     else:
         final_clip_dim = clip_dim if args.image else 0
+        primitive_type = "bezier"
         model = BezierSketchTransformer(num_classes=args.num_classes, clip_dim=final_clip_dim)
         model.load_state_dict(ckpt)
 
     model.to(device)
     model.eval()
 
-    samples = generate_beziers(
-        model,
+    gen_kwargs = dict(
         class_label=args.class_label,
         num_samples=args.num_samples,
         num_steps=args.num_steps,
@@ -317,12 +446,20 @@ def main() -> None:
         cfg_scale=args.cfg_scale if args.image else 1.0,
     )
 
-    plot_bezier_sketches(samples, args.output)
-    print(f"Saved {args.num_samples} samples to {args.output}")
-
-    if args.export_svg:
-        export_svg(samples[0], args.export_svg)
-        print(f"Exported SVG to {args.export_svg}")
+    if primitive_type == "line":
+        samples = generate_lines(model, **gen_kwargs)
+        plot_line_sketches(samples, args.output)
+        print(f"Saved {args.num_samples} line samples to {args.output}")
+        if args.export_svg:
+            export_svg_lines(samples[0], args.export_svg)
+            print(f"Exported line SVG to {args.export_svg}")
+    else:
+        samples = generate_beziers(model, **gen_kwargs)
+        plot_bezier_sketches(samples, args.output)
+        print(f"Saved {args.num_samples} Bezier samples to {args.output}")
+        if args.export_svg:
+            export_svg(samples[0], args.export_svg)
+            print(f"Exported SVG to {args.export_svg}")
 
 
 if __name__ == "__main__":
