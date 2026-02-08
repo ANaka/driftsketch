@@ -12,8 +12,15 @@ wheels/
 # Model artifacts
 checkpoints/
 outputs/
+weights/
 
 # Dataset files (large)
 data/raw/
 data/processed/
+
+# Experiment tracking
+wandb/
+
+# Tool/IDE config
 .worktrees/
+.serena/
