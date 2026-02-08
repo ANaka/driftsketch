@@ -742,13 +742,38 @@ def train() -> None:
                 device=device,
             )
 
+            # Get CLIP features for visualization samples if available
+            vis_clip_features = None
+            if clip_encoder is not None:
+                # Collect one image per (class, slot) from the dataset
+                needed = {c: num_vis_per_class for c in viz_classes}
+                vis_images = []
+                vis_labels_list = []
+                for batch in dataloader:
+                    labels_batch = batch["label"]
+                    images_batch = batch["image"]
+                    for i in range(labels_batch.shape[0]):
+                        lbl = labels_batch[i].item()
+                        if lbl in needed and needed[lbl] > 0:
+                            vis_images.append(images_batch[i])
+                            vis_labels_list.append(lbl)
+                            needed[lbl] -= 1
+                    if all(v == 0 for v in needed.values()):
+                        break
+                vis_images_t = torch.stack(vis_images).to(device)  # (num_vis, 3, 224, 224)
+                # Reorder vis_labels to match the images we actually found
+                vis_labels = torch.tensor(vis_labels_list, dtype=torch.long, device=device)
+                with torch.no_grad():
+                    vis_clip_features = clip_encoder(vis_images_t)  # (num_vis, L, D)
+                num_vis = vis_labels.shape[0]
+
             with torch.no_grad():
                 x = torch.randn(num_vis, 32, 8, device=device)
                 num_steps = 20
                 dt = 1.0 / num_steps
                 for step_i in range(num_steps):
                     t_val = torch.full((num_vis,), step_i * dt, device=device)
-                    v = model(x, t_val, vis_labels)
+                    v = model(x, t_val, vis_labels, clip_features=vis_clip_features)
                     x = x + v * dt
 
                 # Reshape to (num_vis, 32, 4, 2) for plotting
