@@ -98,8 +98,12 @@ def train() -> None:
     parser.add_argument("--p-uncond", type=float, default=0.1, help="Probability of dropping conditioning for CFG")
     parser.add_argument("--clip-model", type=str, default="ViT-B-32", help="CLIP model name")
     parser.add_argument("--clip-pretrained", type=str, default="laion2b_s34b_b79k", help="CLIP pretrained weights")
-    parser.add_argument("--pixel-loss-weight", type=float, default=0.0, help="Weight for pixel rendering loss")
     parser.add_argument("--velocity-loss-weight", type=float, default=1.0, help="Weight for velocity MSE loss")
+    parser.add_argument("--smoothness-loss-weight", type=float, default=0.0, help="Weight for stroke smoothness loss")
+    parser.add_argument("--degenerate-loss-weight", type=float, default=0.0, help="Weight for degenerate stroke loss")
+    parser.add_argument("--coverage-loss-weight", type=float, default=0.0, help="Weight for coverage uniformity loss")
+    parser.add_argument("--pixel-loss-weight", type=float, default=0.0, help="Weight for pixel rendering loss")
+    parser.add_argument("--lpips-loss-weight", type=float, default=0.0, help="Weight for LPIPS perceptual loss")
     parser.add_argument("--pixel-batch-size", type=int, default=4, help="How many samples to render per batch")
     parser.add_argument("--pixel-canvas-size", type=int, default=128, help="Canvas size for differentiable rendering")
     args = parser.parse_args()
@@ -161,11 +165,16 @@ def train() -> None:
                 "clip_dim": clip_dim,
                 "p_uncond": args.p_uncond,
             })
-        if args.pixel_loss_weight > 0:
-            wandb_config_update["pixel_loss_weight"] = args.pixel_loss_weight
-            wandb_config_update["velocity_loss_weight"] = args.velocity_loss_weight
-            wandb_config_update["pixel_batch_size"] = args.pixel_batch_size
-            wandb_config_update["pixel_canvas_size"] = args.pixel_canvas_size
+        wandb_config_update.update({
+            "velocity_loss_weight": args.velocity_loss_weight,
+            "smoothness_loss_weight": args.smoothness_loss_weight,
+            "degenerate_loss_weight": args.degenerate_loss_weight,
+            "coverage_loss_weight": args.coverage_loss_weight,
+            "pixel_loss_weight": args.pixel_loss_weight,
+            "lpips_loss_weight": args.lpips_loss_weight,
+            "pixel_batch_size": args.pixel_batch_size,
+            "pixel_canvas_size": args.pixel_canvas_size,
+        })
         wandb.config.update(wandb_config_update)
 
     collate_fn = None
@@ -194,6 +203,23 @@ def train() -> None:
     # --- Model ---
     model = BezierSketchTransformer(num_classes=num_classes, clip_dim=clip_dim).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    # --- Auxiliary losses setup ---
+    use_geo = args.smoothness_loss_weight > 0 or args.degenerate_loss_weight > 0 or args.coverage_loss_weight > 0
+    use_pixel = args.pixel_loss_weight > 0
+    use_lpips = args.lpips_loss_weight > 0
+
+    if use_geo:
+        from driftsketch.losses import compute_geometric_losses
+
+    if use_pixel or use_lpips:
+        from driftsketch.rendering import render_batch_beziers
+
+    lpips_fn = None
+    if use_lpips:
+        from driftsketch.losses import LPIPSLoss
+
+        lpips_fn = LPIPSLoss().to(device)
 
     # Pick a few classes to visualize during training
     viz_classes = list(range(min(6, num_classes)))
@@ -229,16 +255,32 @@ def train() -> None:
             v_pred = model(xt, t.squeeze(-1).squeeze(-1), labels, clip_features=clip_features, cfg_mask=cfg_mask)
 
             loss_velocity = F.mse_loss(v_pred, v_target)
+            loss = args.velocity_loss_weight * loss_velocity
 
+            # One-step denoised estimate (shared by all aux losses)
+            needs_x1_hat = use_geo or use_pixel or use_lpips
+            if needs_x1_hat:
+                x1_hat = xt + (1.0 - t) * v_pred  # (B, 32, 8)
+                x1_hat_beziers = x1_hat.view(B, 32, 4, 2)
+
+            # Geometric losses (full batch, cheap)
+            geo_logs: dict[str, float] = {}
+            if use_geo:
+                loss_geo, geo_logs = compute_geometric_losses(
+                    x1_hat_beziers,
+                    w_smoothness=args.smoothness_loss_weight,
+                    w_degenerate=args.degenerate_loss_weight,
+                    w_coverage=args.coverage_loss_weight,
+                )
+                loss = loss + loss_geo
+
+            # Pixel + LPIPS losses (subset of batch, expensive)
             loss_pixel = torch.tensor(0.0, device=device)
-            if args.pixel_loss_weight > 0:
-                from driftsketch.rendering import render_batch_beziers
-
+            loss_lpips = torch.tensor(0.0, device=device)
+            if use_pixel or use_lpips:
                 K = min(B, args.pixel_batch_size)
-                # One-step denoised estimate: x1_hat = xt + (1 - t) * v_pred
-                x1_hat = xt[:K] + (1 - t[:K]) * v_pred[:K]
                 rendered_pred = render_batch_beziers(
-                    x1_hat.view(-1, 32, 4, 2),
+                    x1_hat_beziers[:K],
                     canvas_size=args.pixel_canvas_size,
                     max_render=K,
                 )
@@ -248,9 +290,12 @@ def train() -> None:
                         canvas_size=args.pixel_canvas_size,
                         max_render=K,
                     )
-                loss_pixel = F.mse_loss(rendered_pred, rendered_target)
-
-            loss = args.velocity_loss_weight * loss_velocity + args.pixel_loss_weight * loss_pixel
+                if use_pixel:
+                    loss_pixel = F.mse_loss(rendered_pred, rendered_target)
+                    loss = loss + args.pixel_loss_weight * loss_pixel
+                if use_lpips:
+                    loss_lpips = lpips_fn(rendered_pred, rendered_target)
+                    loss = loss + args.lpips_loss_weight * loss_lpips
 
             optimizer.zero_grad()
             loss.backward()
@@ -260,9 +305,16 @@ def train() -> None:
             if wandb_run:
                 import wandb
 
-                metrics = {"loss": loss.item(), "loss_velocity": loss_velocity.item(), "grad_norm": grad_norm.item()}
-                if args.pixel_loss_weight > 0:
-                    metrics["loss_pixel"] = loss_pixel.item()
+                metrics = {
+                    "loss/total": loss.item(),
+                    "loss/velocity": loss_velocity.item(),
+                    "grad_norm": grad_norm.item(),
+                }
+                metrics.update(geo_logs)
+                if use_pixel:
+                    metrics["loss/pixel"] = loss_pixel.item()
+                if use_lpips:
+                    metrics["loss/lpips"] = loss_lpips.item()
                 wandb.log(metrics, step=global_step)
 
             epoch_loss += loss.item()

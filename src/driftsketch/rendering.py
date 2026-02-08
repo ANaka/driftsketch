@@ -11,6 +11,7 @@ def render_beziers_differentiable(
     beziers: torch.Tensor,
     canvas_size: int = 128,
     stroke_width: float = 2.0,
+    softness: float = 1.0,
 ) -> torch.Tensor:
     """Differentiably render a single sketch's Bezier strokes.
 
@@ -18,6 +19,7 @@ def render_beziers_differentiable(
         beziers: (32, 4, 2) cubic Bezier control points in [-1, 1].
         canvas_size: Output image size in pixels.
         stroke_width: Width of rendered strokes in pixels.
+        softness: Edge softness for anti-aliasing (higher = smoother gradients).
 
     Returns:
         (H, W) grayscale image tensor -- white background (1.0), black strokes (0.0).
