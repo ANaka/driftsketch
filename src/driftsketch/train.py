@@ -106,6 +106,16 @@ def train() -> None:
     parser.add_argument("--lpips-loss-weight", type=float, default=0.0, help="Weight for LPIPS perceptual loss")
     parser.add_argument("--pixel-batch-size", type=int, default=4, help="How many samples to render per batch")
     parser.add_argument("--pixel-canvas-size", type=int, default=128, help="Canvas size for differentiable rendering")
+    parser.add_argument("--aesthetic-loss-weight", type=float, default=0.0, help="Weight for aesthetic loss")
+    parser.add_argument("--aesthetic-batch-size", type=int, default=4, help="How many samples to score per batch")
+    parser.add_argument("--aesthetic-every", type=int, default=1, help="Apply aesthetic loss every N steps")
+    parser.add_argument("--aesthetic-model-path", type=str, default=None, help="Path to aesthetic MLP weights (auto-downloads if None)")
+    parser.add_argument("--density-loss-weight", type=float, default=0.0, help="Penalize local line overlap (>0)")
+    parser.add_argument("--curvature-loss-weight", type=float, default=0.0, help="Penalize sharp turns (>0)")
+    parser.add_argument("--length-loss-weight", type=float, default=0.0, help="Penalize total arc length (>0), reward (<0)")
+    parser.add_argument("--uniformity-loss-weight", type=float, default=0.0, help="Penalize spatial spread (>0), reward (<0)")
+    parser.add_argument("--density-grid-size", type=int, default=32, help="Grid resolution for density loss")
+    parser.add_argument("--density-threshold", type=float, default=3.0, help="Density threshold before penalty")
     args = parser.parse_args()
 
     # --- wandb setup ---
@@ -174,6 +184,9 @@ def train() -> None:
             "lpips_loss_weight": args.lpips_loss_weight,
             "pixel_batch_size": args.pixel_batch_size,
             "pixel_canvas_size": args.pixel_canvas_size,
+            "aesthetic_loss_weight": args.aesthetic_loss_weight,
+            "aesthetic_batch_size": args.aesthetic_batch_size,
+            "aesthetic_every": args.aesthetic_every,
         })
         wandb.config.update(wandb_config_update)
 
@@ -212,7 +225,7 @@ def train() -> None:
     if use_geo:
         from driftsketch.losses import compute_geometric_losses
 
-    if use_pixel or use_lpips:
+    if use_pixel or use_lpips or use_aesthetic:
         from driftsketch.rendering import render_batch_beziers
 
     lpips_fn = None
@@ -220,6 +233,13 @@ def train() -> None:
         from driftsketch.losses import LPIPSLoss
 
         lpips_fn = LPIPSLoss().to(device)
+
+    use_aesthetic = args.aesthetic_loss_weight > 0
+    aesthetic_scorer = None
+    if use_aesthetic:
+        from driftsketch.aesthetic import AestheticScorer
+
+        aesthetic_scorer = AestheticScorer(model_path=args.aesthetic_model_path, device=device)
 
     # Pick a few classes to visualize during training
     viz_classes = list(range(min(6, num_classes)))
@@ -232,6 +252,7 @@ def train() -> None:
         epoch_loss = 0.0
         epoch_vel = 0.0
         epoch_pix = 0.0
+        epoch_aes = 0.0
         num_batches = 0
 
         for batch in dataloader:
@@ -258,7 +279,7 @@ def train() -> None:
             loss = args.velocity_loss_weight * loss_velocity
 
             # One-step denoised estimate (shared by all aux losses)
-            needs_x1_hat = use_geo or use_pixel or use_lpips
+            needs_x1_hat = use_geo or use_pixel or use_lpips or use_aesthetic
             if needs_x1_hat:
                 x1_hat = xt + (1.0 - t) * v_pred  # (B, 32, 8)
                 x1_hat_beziers = x1_hat.view(B, 32, 4, 2)
@@ -297,6 +318,19 @@ def train() -> None:
                     loss_lpips = lpips_fn(rendered_pred, rendered_target)
                     loss = loss + args.lpips_loss_weight * loss_lpips
 
+            # Aesthetic loss (subset of batch, expensive)
+            loss_aesthetic = torch.tensor(0.0, device=device)
+            aes_scores = None
+            if use_aesthetic and global_step % args.aesthetic_every == 0:
+                K_aes = min(B, args.aesthetic_batch_size)
+                rendered_aes = render_batch_beziers(
+                    x1_hat_beziers[:K_aes],
+                    canvas_size=224,
+                    max_render=K_aes,
+                )
+                loss_aesthetic, aes_scores = aesthetic_scorer.compute_loss(rendered_aes)
+                loss = loss + args.aesthetic_loss_weight * loss_aesthetic
+
             optimizer.zero_grad()
             loss.backward()
             grad_norm = nn_utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -315,18 +349,25 @@ def train() -> None:
                     metrics["loss/pixel"] = loss_pixel.item()
                 if use_lpips:
                     metrics["loss/lpips"] = loss_lpips.item()
+                if use_aesthetic:
+                    metrics["loss/aesthetic"] = loss_aesthetic.item()
+                    if aes_scores is not None:
+                        metrics["aesthetic/score_mean"] = aes_scores.mean().item()
+                        metrics["aesthetic/score_std"] = aes_scores.std().item()
                 wandb.log(metrics, step=global_step)
 
             epoch_loss += loss.item()
             epoch_vel += loss_velocity.item()
             epoch_pix += loss_pixel.item()
+            epoch_aes += loss_aesthetic.item()
             num_batches += 1
             global_step += 1
 
         avg_loss = epoch_loss / max(num_batches, 1)
         avg_vel = epoch_vel / max(num_batches, 1)
         avg_pix = epoch_pix / max(num_batches, 1)
-        print(f"Epoch {epoch}/{args.epochs}  avg_loss={avg_loss:.6f}  avg_vel={avg_vel:.6f}  avg_pix={avg_pix:.6f}")
+        avg_aes = epoch_aes / max(num_batches, 1)
+        print(f"Epoch {epoch}/{args.epochs}  avg_loss={avg_loss:.6f}  avg_vel={avg_vel:.6f}  avg_pix={avg_pix:.6f}  avg_aes={avg_aes:.6f}")
 
         if wandb_run:
             import wandb
