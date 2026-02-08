@@ -94,6 +94,8 @@ def train() -> None:
     parser.add_argument("--sample-every", type=int, default=2)
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--no-sample-upload", action="store_true", help="Disable uploading sample images to wandb")
+    parser.add_argument("--eval-clip-sim", action="store_true", default=None,
+                        help="Compute CLIP similarity between generated sketches and reference images at eval (auto-enabled with --use-clip)")
     parser.add_argument("--data-dir", type=str, default=None, help="ControlSketch data root")
     parser.add_argument("--categories", nargs="+", default=None, help="Category names to use")
     parser.add_argument("--split", type=str, default="train", help="Dataset split")
@@ -141,6 +143,10 @@ def train() -> None:
     parser.add_argument("--distill-augmentations", type=int, default=4, help="CLIP augmentations per sample")
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to bootstrap checkpoint to load")
     args = parser.parse_args()
+
+    # Auto-enable eval CLIP sim when --use-clip is set
+    if args.eval_clip_sim is None:
+        args.eval_clip_sim = args.use_clip
 
     # --- wandb setup ---
     wandb_run = None
@@ -786,6 +792,59 @@ def train() -> None:
                     {"samples": wandb.Image(sample_path)},
                     step=global_step,
                 )
+
+            # --- Eval CLIP similarity: generate from real images, measure similarity ---
+            if args.eval_clip_sim and clip_encoder is not None and wandb_run:
+                import wandb
+                from driftsketch.rendering import render_batch_beziers as _render_eval
+
+                eval_batch = next(iter(dataloader))
+                eval_images = eval_batch["image"].to(device)
+                eval_labels = eval_batch["label"].to(device)
+                K_eval = min(8, eval_images.shape[0])
+                eval_images = eval_images[:K_eval]
+                eval_labels = eval_labels[:K_eval]
+
+                with torch.no_grad():
+                    eval_clip_feats = clip_encoder(eval_images)  # (K, L, D)
+
+                    # Generate conditioned on these images
+                    x_eval = torch.randn(K_eval, 32, 8, device=device)
+                    eval_steps = 20
+                    eval_dt = 1.0 / eval_steps
+                    for step_i in range(eval_steps):
+                        t_val = torch.full((K_eval,), step_i * eval_dt, device=device)
+                        v = model(x_eval, t_val, eval_labels, clip_features=eval_clip_feats)
+                        x_eval = x_eval + v * eval_dt
+
+                    # Render generated sketches
+                    eval_beziers = x_eval.view(K_eval, 32, 4, 2)
+                    rendered = _render_eval(eval_beziers, canvas_size=224, max_render=K_eval)  # (K, 224, 224)
+
+                    # Expand to 3-channel, apply CLIP normalization
+                    rendered_rgb = rendered.unsqueeze(1).expand(-1, 3, -1, -1)  # (K, 3, 224, 224)
+                    clip_mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+                    clip_std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+                    rendered_norm = (rendered_rgb - clip_mean) / clip_std
+
+                    # Encode rendered sketches with CLIP
+                    sketch_clip_feats = clip_encoder(rendered_norm)  # (K, L, D)
+
+                    # Pool and compute cosine similarity
+                    sketch_pooled = sketch_clip_feats.mean(dim=1)  # (K, D)
+                    target_pooled = eval_clip_feats.mean(dim=1)  # (K, D)
+                    cos_sim = F.cosine_similarity(sketch_pooled, target_pooled, dim=-1)  # (K,)
+
+                wandb.log(
+                    {
+                        "eval/clip_cosine_sim_mean": cos_sim.mean().item(),
+                        "eval/clip_cosine_sim_std": cos_sim.std().item(),
+                        "eval/clip_cosine_sim_min": cos_sim.min().item(),
+                        "eval/clip_cosine_sim_max": cos_sim.max().item(),
+                    },
+                    step=global_step,
+                )
+                print(f"  Eval CLIP sim: {cos_sim.mean().item():.4f} +/- {cos_sim.std().item():.4f}")
 
             if ema is not None:
                 ema.restore()
