@@ -284,7 +284,12 @@ def train() -> None:
 
     # --- Run name and output directory ---
     if wandb_run:
-        run_name = wandb_run.name
+        # Rearrange "stellar-disco-19" -> "019-stellar-disco" for sorted dirs
+        parts = wandb_run.name.rsplit("-", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            run_name = f"{int(parts[1]):03d}-{parts[0]}"
+        else:
+            run_name = wandb_run.name
     else:
         run_name = "local"
     output_dir = os.path.join("outputs", "training", run_name)
