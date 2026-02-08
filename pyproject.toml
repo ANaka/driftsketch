@@ -13,7 +13,7 @@ dependencies = [
 [project.optional-dependencies]
 wandb = ["wandb>=0.15.0"]
 render = ["pydiffvg @ file:///home/naka/code/easydiffvg"]
-clip = ["open_clip_torch>=2.20.0"]
+clip = ["open_clip_torch>=2.20.0", "torchvision>=0.15.0"]
 lpips = ["lpips>=0.1.4"]
 aesthetic = ["open_clip_torch>=2.20.0"]
 all = ["driftsketch[wandb,render,clip,lpips,aesthetic]"]
