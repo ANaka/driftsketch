@@ -20,6 +20,7 @@ all = ["driftsketch[wandb,render,clip,lpips,aesthetic]"]
 
 [project.scripts]
 driftsketch-train = "driftsketch.train:train"
+driftsketch-train-lines = "driftsketch.train_lines:train_lines"
 driftsketch-generate = "driftsketch.inference:main"
 
 [build-system]
