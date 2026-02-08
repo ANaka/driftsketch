@@ -91,14 +91,14 @@ def train() -> None:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--sample-every", type=int, default=10)
+    parser.add_argument("--sample-every", type=int, default=2)
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--no-sample-upload", action="store_true", help="Disable uploading sample images to wandb")
     parser.add_argument("--data-dir", type=str, default=None, help="ControlSketch data root")
     parser.add_argument("--categories", nargs="+", default=None, help="Category names to use")
     parser.add_argument("--split", type=str, default="train", help="Dataset split")
     parser.add_argument("--num-classes", type=int, default=None, help="Number of classes (auto from dataset if omitted)")
-    parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--use-clip", action="store_true", help="Enable CLIP image conditioning")
     parser.add_argument("--p-uncond", type=float, default=0.1, help="Probability of dropping conditioning for CFG")
     parser.add_argument("--clip-model", type=str, default="ViT-B-32", help="CLIP model name")
@@ -272,6 +272,7 @@ def train() -> None:
         drop_last=True,
         num_workers=args.num_workers,
         pin_memory=True,
+        persistent_workers=args.num_workers > 0,
         collate_fn=collate_fn,
     )
 

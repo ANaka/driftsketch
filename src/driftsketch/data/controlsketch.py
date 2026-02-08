@@ -121,37 +121,62 @@ class ControlSketchDataset(Dataset):
         self.label_to_category = {i: cat for cat, i in self.category_to_label.items()}
         self.num_classes = len(all_cats)
 
-        # Build index of (npz_path, category) pairs
-        self.samples: list[tuple[Path, str]] = []
+        # Build index and pre-cache all data into memory
+        samples: list[tuple[Path, str]] = []
         for cat in self.categories:
             cat_dir = self.split_dir / cat
             for npz_file in sorted(cat_dir.glob("*.npz")):
-                self.samples.append((npz_file, cat))
+                samples.append((npz_file, cat))
+
+        print(f"Pre-caching {len(samples)} samples from {self.split_dir}...")
+        self._beziers: list[torch.Tensor] = []
+        self._points: list[torch.Tensor] = []
+        self._labels: list[torch.Tensor] = []
+        self._captions: list[str] = []
+        self._image_bytes: list[bytes | None] = []
+        self._attn_maps: list[torch.Tensor | None] = []
+        self._masks: list[torch.Tensor | None] = []
+
+        for npz_path, cat in samples:
+            data = np.load(npz_path, allow_pickle=True)
+            beziers = parse_svg_beziers(str(data["svg_32s"]))
+            self._beziers.append(torch.from_numpy(beziers))
+            self._points.append(torch.from_numpy(
+                beziers_to_points(beziers, self.num_points)
+            ))
+            self._labels.append(torch.tensor(
+                self.category_to_label[cat], dtype=torch.long
+            ))
+            self._captions.append(str(data["caption"]))
+
+            if self.return_images:
+                self._image_bytes.append(bytes(data["image"]))
+                self._attn_maps.append(torch.from_numpy(data["attn_map"].copy()))
+                self._masks.append(torch.from_numpy(data["mask"].copy()))
+            else:
+                self._image_bytes.append(None)
+                self._attn_maps.append(None)
+                self._masks.append(None)
+
+        self._num_samples = len(samples)
+        print(f"Cached {self._num_samples} samples.")
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return self._num_samples
 
     def __getitem__(self, idx: int) -> dict:
-        npz_path, cat = self.samples[idx]
-        data = np.load(npz_path, allow_pickle=True)
-
-        svg_str = str(data["svg_32s"])
-        beziers = parse_svg_beziers(svg_str)
-        points = beziers_to_points(beziers, self.num_points)
-        label = self.category_to_label[cat]
-
         result = {
-            "beziers": torch.from_numpy(beziers),           # (32, 4, 2)
-            "points": torch.from_numpy(points),             # (num_points, 2)
-            "label": torch.tensor(label, dtype=torch.long), # scalar
-            "caption": str(data["caption"]),
+            "beziers": self._beziers[idx],
+            "points": self._points[idx],
+            "label": self._labels[idx],
+            "caption": self._captions[idx],
         }
 
         if self.return_images:
-            img_bytes = bytes(data["image"])
+            img_bytes = self._image_bytes[idx]
             result["image_bytes"] = img_bytes
-            result["attn_map"] = torch.from_numpy(data["attn_map"].copy())  # (512, 512)
-            result["mask"] = torch.from_numpy(data["mask"].copy())          # (512, 512)
+            result["attn_map"] = self._attn_maps[idx]
+            result["mask"] = self._masks[idx]
 
             if self.image_transform is not None:
                 from PIL import Image
@@ -161,12 +186,13 @@ class ControlSketchDataset(Dataset):
         return result
 
     def stats(self) -> dict:
-        per_cat = {}
-        for _, cat in self.samples:
-            per_cat[cat] = per_cat.get(cat, 0) + 1
+        per_cat = {cat: 0 for cat in self.categories}
+        for label in self._labels:
+            cat = self.label_to_category[label.item()]
+            per_cat[cat] += 1
         return {
             "split": self.split_dir.name,
-            "total_samples": len(self.samples),
+            "total_samples": self._num_samples,
             "num_classes": self.num_classes,
             "categories": self.categories,
             "samples_per_category": per_cat,
