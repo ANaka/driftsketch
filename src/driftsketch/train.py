@@ -404,6 +404,7 @@ def train() -> None:
         epoch_loss = 0.0
         epoch_vel = 0.0
         epoch_pix = 0.0
+        epoch_aux_accum: dict[str, float] = {}
         num_batches = 0
         epoch_samples = 0
         epoch_start = time.monotonic()
@@ -468,20 +469,49 @@ def train() -> None:
                 loss_velocity = torch.tensor(0.0)
                 loss_pixel = torch.tensor(0.0)
 
+                # Collect aux loss values for epoch averaging
+                aux_vals: dict[str, float] = {}
+                aux_vals.update(clip_logs)
+                aux_vals.update(geo_logs)
+                aux_vals.update(plotter_logs)
+                for k, v in aux_vals.items():
+                    epoch_aux_accum[k] = epoch_aux_accum.get(k, 0.0) + v
+
                 if wandb_run:
                     import wandb
 
+                    # Weighted contributions
+                    weighted: dict[str, float] = {}
+                    if use_geo:
+                        if args.smoothness_loss_weight > 0 and "loss/geo_smoothness" in geo_logs:
+                            weighted["loss_weighted/geo_smoothness"] = args.smoothness_loss_weight * geo_logs["loss/geo_smoothness"]
+                        if args.degenerate_loss_weight > 0 and "loss/geo_degenerate" in geo_logs:
+                            weighted["loss_weighted/geo_degenerate"] = args.degenerate_loss_weight * geo_logs["loss/geo_degenerate"]
+                        if args.coverage_loss_weight > 0 and "loss/geo_coverage" in geo_logs:
+                            weighted["loss_weighted/geo_coverage"] = args.coverage_loss_weight * geo_logs["loss/geo_coverage"]
+                    if use_plotter:
+                        if args.density_loss_weight != 0 and "loss/plotter_density" in plotter_logs:
+                            weighted["loss_weighted/plotter_density"] = args.density_loss_weight * plotter_logs["loss/plotter_density"]
+                        if args.curvature_loss_weight != 0 and "loss/plotter_curvature" in plotter_logs:
+                            weighted["loss_weighted/plotter_curvature"] = args.curvature_loss_weight * plotter_logs["loss/plotter_curvature"]
+                        if args.length_loss_weight != 0 and "loss/plotter_length" in plotter_logs:
+                            weighted["loss_weighted/plotter_length"] = args.length_loss_weight * plotter_logs["loss/plotter_length"]
+                        if args.uniformity_loss_weight != 0 and "loss/plotter_uniformity" in plotter_logs:
+                            weighted["loss_weighted/plotter_uniformity"] = args.uniformity_loss_weight * plotter_logs["loss/plotter_uniformity"]
+
+                    aux_total = sum(weighted.values())
+
                     metrics = {
                         "loss/total": loss.item(),
+                        "loss/aux_total": aux_total,
                         "grad_norm": grad_norm.item(),
                         "lr": optimizer.param_groups[0]["lr"],
                         "output/variance": x.var().item(),
                         "output/mean_abs": x.abs().mean().item(),
                         "output/out_of_range_frac": (x.abs() > 1.0).float().mean().item(),
                     }
-                    metrics.update(clip_logs)
-                    metrics.update(geo_logs)
-                    metrics.update(plotter_logs)
+                    metrics.update(aux_vals)
+                    metrics.update(weighted)
                     wandb.log(metrics, step=global_step)
             else:
                 # --- Standard velocity MSE training loop ---
@@ -582,6 +612,22 @@ def train() -> None:
                 if ema is not None:
                     ema.update()
 
+                # Collect aux loss values for epoch averaging
+                aux_vals: dict[str, float] = {}
+                aux_vals.update(geo_logs)
+                aux_vals.update(plotter_logs)
+                if use_pixel:
+                    aux_vals["loss/pixel"] = loss_pixel.item()
+                if use_lpips:
+                    aux_vals["loss/lpips"] = loss_lpips.item()
+                if use_aesthetic:
+                    aux_vals["loss/aesthetic"] = loss_aesthetic.item()
+                    if aes_scores is not None:
+                        aux_vals["aesthetic/score_mean"] = aes_scores.mean().item()
+                        aux_vals["aesthetic/score_std"] = aes_scores.std().item()
+                for k, v in aux_vals.items():
+                    epoch_aux_accum[k] = epoch_aux_accum.get(k, 0.0) + v
+
                 if wandb_run:
                     import wandb
 
@@ -591,9 +637,38 @@ def train() -> None:
                             v_pred.reshape(B, -1), v_target.reshape(B, -1), dim=1
                         ).mean()
 
+                    # Weighted contributions of each aux loss
+                    weighted: dict[str, float] = {}
+                    weighted["loss_weighted/velocity"] = args.velocity_loss_weight * loss_velocity.item()
+                    if use_geo:
+                        if args.smoothness_loss_weight > 0 and "loss/geo_smoothness" in geo_logs:
+                            weighted["loss_weighted/geo_smoothness"] = args.smoothness_loss_weight * geo_logs["loss/geo_smoothness"]
+                        if args.degenerate_loss_weight > 0 and "loss/geo_degenerate" in geo_logs:
+                            weighted["loss_weighted/geo_degenerate"] = args.degenerate_loss_weight * geo_logs["loss/geo_degenerate"]
+                        if args.coverage_loss_weight > 0 and "loss/geo_coverage" in geo_logs:
+                            weighted["loss_weighted/geo_coverage"] = args.coverage_loss_weight * geo_logs["loss/geo_coverage"]
+                    if use_pixel:
+                        weighted["loss_weighted/pixel"] = args.pixel_loss_weight * loss_pixel.item()
+                    if use_lpips:
+                        weighted["loss_weighted/lpips"] = args.lpips_loss_weight * loss_lpips.item()
+                    if use_aesthetic:
+                        weighted["loss_weighted/aesthetic"] = args.aesthetic_loss_weight * loss_aesthetic.item()
+                    if use_plotter:
+                        if args.density_loss_weight != 0 and "loss/plotter_density" in plotter_logs:
+                            weighted["loss_weighted/plotter_density"] = args.density_loss_weight * plotter_logs["loss/plotter_density"]
+                        if args.curvature_loss_weight != 0 and "loss/plotter_curvature" in plotter_logs:
+                            weighted["loss_weighted/plotter_curvature"] = args.curvature_loss_weight * plotter_logs["loss/plotter_curvature"]
+                        if args.length_loss_weight != 0 and "loss/plotter_length" in plotter_logs:
+                            weighted["loss_weighted/plotter_length"] = args.length_loss_weight * plotter_logs["loss/plotter_length"]
+                        if args.uniformity_loss_weight != 0 and "loss/plotter_uniformity" in plotter_logs:
+                            weighted["loss_weighted/plotter_uniformity"] = args.uniformity_loss_weight * plotter_logs["loss/plotter_uniformity"]
+
+                    aux_total = sum(v for k, v in weighted.items() if k != "loss_weighted/velocity")
+
                     metrics = {
                         "loss/total": loss.item(),
                         "loss/velocity": loss_velocity.item(),
+                        "loss/aux_total": aux_total,
                         "velocity/cosine_sim": cos_sim.item(),
                         "grad_norm": grad_norm.item(),
                         "lr": optimizer.param_groups[0]["lr"],
@@ -603,17 +678,12 @@ def train() -> None:
                         metrics["output/variance"] = x1_hat.var().item()
                         metrics["output/mean_abs"] = x1_hat.abs().mean().item()
                         metrics["output/out_of_range_frac"] = (x1_hat.abs() > 1.0).float().mean().item()
-                    metrics.update(geo_logs)
-                    metrics.update(plotter_logs)
-                    if use_pixel:
-                        metrics["loss/pixel"] = loss_pixel.item()
-                    if use_lpips:
-                        metrics["loss/lpips"] = loss_lpips.item()
-                    if use_aesthetic:
-                        metrics["loss/aesthetic"] = loss_aesthetic.item()
-                        if aes_scores is not None:
-                            metrics["aesthetic/score_mean"] = aes_scores.mean().item()
-                            metrics["aesthetic/score_std"] = aes_scores.std().item()
+                    # Loss scale ratio: how big are aux losses vs velocity
+                    vel_val = loss_velocity.item()
+                    if vel_val > 1e-8 and aux_total > 0:
+                        metrics["loss_ratio/aux_to_velocity"] = aux_total / vel_val
+                    metrics.update(aux_vals)
+                    metrics.update(weighted)
                     wandb.log(metrics, step=global_step)
 
             epoch_loss += loss.item()
@@ -640,17 +710,18 @@ def train() -> None:
         if wandb_run:
             import wandb
 
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "epoch/avg_loss": avg_loss,
-                    "epoch/avg_velocity": avg_vel,
-                    "epoch/avg_pixel": avg_pix,
-                    "timing/epoch_duration_sec": epoch_duration,
-                    "timing/samples_per_sec": samples_per_sec,
-                },
-                step=global_step,
-            )
+            epoch_metrics = {
+                "epoch": epoch,
+                "epoch/avg_loss": avg_loss,
+                "epoch/avg_velocity": avg_vel,
+                "epoch/avg_pixel": avg_pix,
+                "timing/epoch_duration_sec": epoch_duration,
+                "timing/samples_per_sec": samples_per_sec,
+            }
+            # Epoch averages for all aux losses
+            for k, v in epoch_aux_accum.items():
+                epoch_metrics[f"epoch/avg_{k.split('/')[-1]}"] = v / max(num_batches, 1)
+            wandb.log(epoch_metrics, step=global_step)
 
         # --- Periodic sample generation ---
         is_sample_epoch = epoch % args.sample_every == 0 or epoch == args.epochs
