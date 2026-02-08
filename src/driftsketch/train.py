@@ -3,6 +3,7 @@
 import argparse
 import math
 import os
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -92,6 +93,7 @@ def train() -> None:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--sample-every", type=int, default=10)
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--no-sample-upload", action="store_true", help="Disable uploading sample images to wandb")
     parser.add_argument("--data-dir", type=str, default=None, help="ControlSketch data root")
     parser.add_argument("--categories", nargs="+", default=None, help="Category names to use")
     parser.add_argument("--split", type=str, default="train", help="Dataset split")
@@ -402,6 +404,8 @@ def train() -> None:
         epoch_vel = 0.0
         epoch_pix = 0.0
         num_batches = 0
+        epoch_samples = 0
+        epoch_start = time.monotonic()
 
         for batch in dataloader:
             if args.distill:
@@ -470,6 +474,9 @@ def train() -> None:
                         "loss/total": loss.item(),
                         "grad_norm": grad_norm.item(),
                         "lr": optimizer.param_groups[0]["lr"],
+                        "output/variance": x.var().item(),
+                        "output/mean_abs": x.abs().mean().item(),
+                        "output/out_of_range_frac": (x.abs() > 1.0).float().mean().item(),
                     }
                     metrics.update(clip_logs)
                     metrics.update(geo_logs)
@@ -577,12 +584,24 @@ def train() -> None:
                 if wandb_run:
                     import wandb
 
+                    # Velocity prediction quality
+                    with torch.no_grad():
+                        cos_sim = F.cosine_similarity(
+                            v_pred.reshape(B, -1), v_target.reshape(B, -1), dim=1
+                        ).mean()
+
                     metrics = {
                         "loss/total": loss.item(),
                         "loss/velocity": loss_velocity.item(),
+                        "velocity/cosine_sim": cos_sim.item(),
                         "grad_norm": grad_norm.item(),
                         "lr": optimizer.param_groups[0]["lr"],
                     }
+                    # x1_hat output health (when computed)
+                    if needs_x1_hat:
+                        metrics["output/variance"] = x1_hat.var().item()
+                        metrics["output/mean_abs"] = x1_hat.abs().mean().item()
+                        metrics["output/out_of_range_frac"] = (x1_hat.abs() > 1.0).float().mean().item()
                     metrics.update(geo_logs)
                     metrics.update(plotter_logs)
                     if use_pixel:
@@ -599,21 +618,38 @@ def train() -> None:
             epoch_loss += loss.item()
             epoch_vel += loss_velocity.item()
             epoch_pix += loss_pixel.item()
+            epoch_samples += B
             num_batches += 1
             global_step += 1
 
         scheduler.step()
 
+        epoch_duration = time.monotonic() - epoch_start
         avg_loss = epoch_loss / max(num_batches, 1)
         avg_vel = epoch_vel / max(num_batches, 1)
         avg_pix = epoch_pix / max(num_batches, 1)
+        samples_per_sec = epoch_samples / max(epoch_duration, 1e-6)
         cur_lr = optimizer.param_groups[0]["lr"]
-        print(f"Epoch {epoch}/{args.epochs}  avg_loss={avg_loss:.6f}  avg_vel={avg_vel:.6f}  avg_pix={avg_pix:.6f}  lr={cur_lr:.2e}")
+        print(
+            f"Epoch {epoch}/{args.epochs}  avg_loss={avg_loss:.6f}  avg_vel={avg_vel:.6f}"
+            f"  avg_pix={avg_pix:.6f}  lr={cur_lr:.2e}  {samples_per_sec:.0f} samples/s"
+            f"  ({epoch_duration:.1f}s)"
+        )
 
         if wandb_run:
             import wandb
 
-            wandb.log({"epoch_avg_loss": avg_loss}, step=global_step)
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "epoch/avg_loss": avg_loss,
+                    "epoch/avg_velocity": avg_vel,
+                    "epoch/avg_pixel": avg_pix,
+                    "timing/epoch_duration_sec": epoch_duration,
+                    "timing/samples_per_sec": samples_per_sec,
+                },
+                step=global_step,
+            )
 
         # --- Periodic sample generation ---
         is_sample_epoch = epoch % args.sample_every == 0 or epoch == args.epochs
@@ -643,11 +679,26 @@ def train() -> None:
             if wandb_run:
                 import wandb
 
+                # Per-stroke lengths (approximate via control point chord lengths)
+                # generated_beziers: (num_vis, 32, 4, 2)
+                cp_diffs = generated_beziers[:, :, 1:, :] - generated_beziers[:, :, :-1, :]  # (N,32,3,2)
+                chord_lengths = cp_diffs.norm(dim=-1).sum(dim=-1)  # (N, 32)
+
+                # Bounding box coverage: fraction of [-1,1]^2 used
+                all_pts = generated_beziers.reshape(-1, 2)
+                bbox_min = all_pts.min(dim=0).values
+                bbox_max = all_pts.max(dim=0).values
+                bbox_area = ((bbox_max - bbox_min).clamp(min=0).prod()).item()
+                canvas_area = 4.0  # [-1,1]^2
+
                 wandb.log(
                     {
-                        "output_variance": x.var().item(),
-                        "output_mean_abs": x.abs().mean().item(),
-                        "output_std": x.std().item(),
+                        "samples/output_variance": x.var().item(),
+                        "samples/output_mean_abs": x.abs().mean().item(),
+                        "samples/out_of_range_frac": (x.abs() > 1.0).float().mean().item(),
+                        "samples/stroke_length_mean": chord_lengths.mean().item(),
+                        "samples/stroke_length_std": chord_lengths.std().item(),
+                        "samples/bbox_coverage": bbox_area / canvas_area,
                     },
                     step=global_step,
                 )
@@ -656,7 +707,7 @@ def train() -> None:
             _plot_bezier_samples(generated_beziers, vis_labels, label_names, sample_path)
             print(f"  Saved samples to {sample_path}")
 
-            if wandb_run:
+            if wandb_run and not args.no_sample_upload:
                 import wandb
 
                 wandb.log(
